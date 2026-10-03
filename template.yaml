@@ -3,39 +3,34 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   home-lab-failover
 
-  Sample SAM Template for home-lab-failover
+  Scheduled watchdog that checks the home lab API health endpoint
 
-# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
   Function:
-    Timeout: 3
+    Timeout: 10
 
 Resources:
-  HelloWorldFunction:
-    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+  WatchdogFunction:
+    Type: AWS::Serverless::Function 
     Properties:
-      CodeUri: hello_world/
+      CodeUri: watchdog/
       Handler: app.lambda_handler
       Runtime: python3.14
       Architectures:
         - x86_64
+      Environment:
+        Variables:
+          HOME_LAB_API_URL: https://gv-api.lab-ocp.com
       Events:
-        HelloWorld:
-          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+        Every5Min:
+          Type: ScheduleV2
           Properties:
-            Path: /hello
-            Method: get
+            ScheduleExpression: rate(5 minutes)
 
 Outputs:
-  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
-  # Find out more about other implicit resources you can reference within SAM
-  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
-  HelloWorldApi:
-    Description: "API Gateway endpoint URL for Prod stage for Hello World function"
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/hello/"
-  HelloWorldFunction:
-    Description: "Hello World Lambda Function ARN"
-    Value: !GetAtt HelloWorldFunction.Arn
-  HelloWorldFunctionIamRole:
-    Description: "Implicit IAM Role created for Hello World function"
-    Value: !GetAtt HelloWorldFunctionRole.Arn
+  WatchdogFunction:
+    Description: "Watchdog Lambda Function ARN"
+    Value: !GetAtt WatchdogFunction.Arn
+  WatchdogFunctionIamRole:
+    Description: "Implicit IAM Role created for Watchdog function"
+    Value: !GetAtt WatchdogFunctionRole.Arn
