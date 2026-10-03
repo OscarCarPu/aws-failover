@@ -1,9 +1,12 @@
 import urllib.request
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 def lambda_handler(event, context):
     health_url = os.getenv("HOME_LAB_API_URL", "https://gv-api.lab-ocp.com") + "/health"
+    now = datetime.now(ZoneInfo("Europe/Madrid"))
 
     try:
         req = urllib.request.Request(
@@ -12,6 +15,6 @@ def lambda_handler(event, context):
         )
         health_response = urllib.request.urlopen(req, timeout=5)
         if health_response.status == 200:
-            print("ok")
+            print(f"HOMELAB HEALTHY on {now}")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"HOMELAB UNHEALTHY on {now}")
