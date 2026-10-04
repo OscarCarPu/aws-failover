@@ -5,6 +5,18 @@ Description: >
 
   Scheduled watchdog that checks the home lab API health endpoint
 
+Parameters:
+  BackupHourlyDays:
+    Type: Number 
+    Default: 2 
+    MinValue: 1 
+    Description: Days gv-db/hourly/ objects are kept.
+  BackupDailyDays:
+    Type: Number
+    Default: 30 
+    MinValue: 1 
+    Description: Days gv-db/daily/ objects are kept 
+
 Globals:
   Function:
     Timeout: 10
@@ -26,6 +38,36 @@ Resources:
           Type: ScheduleV2
           Properties:
             ScheduleExpression: rate(5 minutes)
+  BackupBucket:
+    Type: AWS::S3::Bucket 
+    DeletionPolicy: Retain 
+    UpdateReplacePolicy: Retain 
+    Properties:  
+      LifecycleConfiguration:
+        Rules:
+          - Id: hourly 
+            Status: Enabled
+            Prefix: gv-db/hourly/
+            ExpirationInDays: !Ref BackupHourlyDays
+          - Id: daily 
+            Status: Enabled
+            Prefix: gv-db/daily/
+            ExpirationInDays: !Ref BackupDailyDays
+
+  BackupUploader:
+    Type: AWS::IAM::User 
+    Properties:
+      Policies:
+        - PolicyName: put-new-backups-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow 
+                Action: s3:PutObject
+                Resource: !Sub '${BackupBucket.Arn}/gv-db/*'
+                Condition:
+                  'Null':
+                    's3:if-none-match': 'false'
 
 Outputs:
   WatchdogFunction:
@@ -34,3 +76,9 @@ Outputs:
   WatchdogFunctionIamRole:
     Description: "Implicit IAM Role created for Watchdog function"
     Value: !GetAtt WatchdogFunctionRole.Arn
+  BackupBucketName:
+    Description: "Bucket for gv-api's backups (BACKUP_S3_BUCKET)"
+    Value: !Ref BackupBucket
+  BackupUploaderName:
+    Description: "IAM user whose access key goes in gv-api's .env"
+    Value: !Ref BackupUploader
