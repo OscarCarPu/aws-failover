@@ -7,7 +7,7 @@ SAM stack (`eu-south-2`) for the home lab:
 
 ## Watchdog
 
-`watchdog/app.py` runs on an EventBridge Scheduler rule (`rate(5 minutes)`). It sends a `GET` to `$HOME_LAB_API_URL/health` (default `https://gv-api.lab-ocp.com`) with a 5 s timeout. It logs one line to CloudWatch with a Europe/Madrid timestamp:
+`watchdog/app.py` runs on an EventBridge Scheduler rule (`rate(5 minutes)`). It sends a `GET` to `$HOME_LAB_API_URL/health` (default `https://gv-api.lab-ocp.com`) with a 5 s timeout. It logs one line to CloudWatch with a timestamp:
 
 - `HOMELAB HEALTHY on <time>`: the endpoint returned 200.
 - `HOMELAB UNHEALTHY on <time>`: the request failed or timed out.

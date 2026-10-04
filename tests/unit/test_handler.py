@@ -12,7 +12,7 @@ def test_health_ok(monkeypatch, capsys):
 
     app.lambda_handler({}, None)
 
-    assert capsys.readouterr().out == "ok\n"
+    assert capsys.readouterr().out.startswith("HOMELAB HEALTHY on ")
 
 
 def test_health_down(monkeypatch, capsys):
@@ -23,4 +23,4 @@ def test_health_down(monkeypatch, capsys):
 
     app.lambda_handler({}, None)
 
-    assert capsys.readouterr().out.startswith("Error:")
+    assert capsys.readouterr().out.startswith("HOMELAB UNHEALTHY on ")

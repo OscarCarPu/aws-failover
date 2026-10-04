@@ -1,12 +1,11 @@
 import urllib.request
 import os
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 
 def lambda_handler(event, context):
     health_url = os.getenv("HOME_LAB_API_URL", "https://gv-api.lab-ocp.com") + "/health"
-    now = datetime.now(ZoneInfo("Europe/Madrid"))
+    now = datetime.now()
 
     try:
         req = urllib.request.Request(
