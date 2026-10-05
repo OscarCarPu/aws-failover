@@ -69,6 +69,52 @@ Resources:
                   'Null':
                     's3:if-none-match': 'false'
 
+  GvApiRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: gv-api
+      ImageTagMutability: MUTABLE
+
+  GvWebRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: gv-web
+      ImageTagMutability: MUTABLE
+
+  DeployUser:
+    Type: AWS::IAM::User
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserName: gv-deploy
+      Policies:
+        - PolicyName: gv-ecr-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                  - ecr:BatchDeleteImage
+                Resource:
+                  - !GetAtt GvApiRepository.Arn
+                  - !GetAtt GvWebRepository.Arn
+
 Outputs:
   WatchdogFunction:
     Description: "Watchdog Lambda Function ARN"
@@ -82,3 +128,9 @@ Outputs:
   BackupUploaderName:
     Description: "IAM user whose access key goes in gv-api's .env"
     Value: !Ref BackupUploader
+  GvApiRepositoryUri:
+    Description: "ECR repository for gv-api images"
+    Value: !GetAtt GvApiRepository.RepositoryUri
+  GvWebRepositoryUri:
+    Description: "ECR repository for gv-web images"
+    Value: !GetAtt GvWebRepository.RepositoryUri
