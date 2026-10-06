@@ -15,7 +15,7 @@ Parameters:
     Type: Number
     Default: 30 
     MinValue: 1 
-    Description: Days gv-db/daily/ objects are kept 
+    Description: Days gv-db/daily/ objects are kept
 
 Globals:
   Function:
@@ -32,7 +32,29 @@ Resources:
         - x86_64
       Environment:
         Variables:
-          HOME_LAB_API_URL: https://gv-api.lab-ocp.com
+          HOME_LAB_API_URL: https://gv-health.lab-ocp.com
+          FAILOVER_INSTANCE_ID: !Ref FailoverInstance 
+      Policies:
+        - Version: '2012-10-17'
+          Statement: 
+            - Effect: Allow 
+              Action: ssm:SendCommand 
+              Resource: 
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${FailoverInstance}
+            - Effect: Allow
+              Action:
+                - ssm:GetCommandInvocation
+                - ssm:ListCommandInvocations
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+                - ssm:GetParametersByPath
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/*
       Events:
         Every5Min:
           Type: ScheduleV2
@@ -115,6 +137,110 @@ Resources:
                   - !GetAtt GvApiRepository.Arn
                   - !GetAtt GvWebRepository.Arn
 
+  FailoverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Failover instance, no inbound (SSM + cloudflared are outbound only)
+
+  FailoverInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow 
+            Principal:
+              Service: ec2.amazonaws.com 
+            Action: sts:AssumeRole 
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ecr-pull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow 
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow 
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  - !GetAtt GvApiRepository.Arn 
+                  - !GetAtt GvWebRepository.Arn 
+        - PolicyName: backup-bucket-rw 
+          PolicyDocument: 
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow 
+                Action: s3:ListBucket 
+                Resource: !GetAtt BackupBucket.Arn 
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub '${BackupBucket.Arn}/gv-db/*'
+                  - !Sub '${BackupBucket.Arn}/ec2/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub '${BackupBucket.Arn}/gv-db/hourly/*'
+                  - !Sub '${BackupBucket.Arn}/gv-db/daily/*'
+                Condition:
+                  'Null':
+                    's3:if-none-match': 'false'
+        - PolicyName: read-parameters
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/ec2
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/ec2/*
+
+  FailoverInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref FailoverInstanceRole
+
+  FailoverInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      SecurityGroupIds:
+        - !Ref FailoverSecurityGroup
+      IamInstanceProfile: !Ref FailoverInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: gv-failover
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          cat > /etc/gv.env <<EOF
+          AWS_REGION=${AWS::Region}
+          BUCKET=${BackupBucket}
+          REGISTRY=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          EOF
+          aws s3 sync --region ${AWS::Region} s3://${BackupBucket}/ec2/ /opt/gv/
+          bash /opt/gv/setup.sh
+
 Outputs:
   WatchdogFunction:
     Description: "Watchdog Lambda Function ARN"
@@ -134,3 +260,6 @@ Outputs:
   GvWebRepositoryUri:
     Description: "ECR repository for gv-web images"
     Value: !GetAtt GvWebRepository.RepositoryUri
+  FailoverInstanceId:
+    Description: "Failover EC2 instance (start/stop, Session Manager)"
+    Value: !Ref FailoverInstance

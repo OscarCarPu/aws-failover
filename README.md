@@ -14,6 +14,8 @@ SAM stack (`eu-south-2`) for the home lab.
 ```bash
 make test       # unit tests
 make local-run  # build and invoke the watchdog locally
-make deploy     # build and deploy (stack: home-lab-failover)
+make deploy     # sync ec2/ to S3, build and deploy (stack: home-lab-failover)
+make ec2-sync   # sync ec2/ to S3 only
+make ec2-secrets NAME=<name> [FILE=<path>]  # SecureString /home-lab-failover/ec2/<name>
 make hooks      # run the tests before every commit
 ```

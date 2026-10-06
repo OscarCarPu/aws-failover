@@ -1,0 +1,18 @@
+[Unit]
+Description=Restore the newest S3 dump and start the gv stack
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=15min
+Restart=on-failure
+RestartSec=30
+EnvironmentFile=/etc/gv.env
+ExecStartPre=/usr/bin/aws s3 sync s3://${BUCKET}/ec2/ /opt/gv/
+ExecStart=/bin/bash /opt/gv/boot.sh
+
+[Install]
+WantedBy=multi-user.target

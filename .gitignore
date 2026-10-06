@@ -244,3 +244,6 @@ $RECYCLE.BIN/
 # End of https://www.gitignore.io/api/osx,linux,python,windows,pycharm,visualstudiocode
 
 .aws-sam
+
+# Failover instance secrets, pushed to SSM with make ec2-secrets
+ec2/*.env

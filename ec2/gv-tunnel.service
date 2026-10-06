@@ -1,0 +1,10 @@
+[Unit]
+Description=cloudflared alt tunnel
+Requires=gv-boot.service
+After=gv-boot.service
+
+[Service]
+EnvironmentFile=/etc/gv.env
+ExecStart=/bin/bash -c 't=$$(aws ssm get-parameter --with-decryption --name /home-lab-failover/ec2/tunnel-token --query Parameter.Value --output text) && TUNNEL_TOKEN=$$t exec cloudflared --no-autoupdate tunnel run'
+Restart=on-failure
+RestartSec=10
