@@ -12,6 +12,8 @@ Don't deploy during a failover: a newer AMI replaces the instance.
 2. every start, `gv-boot.service` runs `boot.sh`: empties the DB, restores the newest dump from `gv-db/`, starts `compose.yaml`
 3. `gv-tunnel.service` starts only after a successful restore
 
+No dump in S3 makes `boot.sh` exit 3 and `gv-boot.service` does not retry (any other failure retries every 30 s).
+
 Failback: `failback.sh` (Run Command) stops the apps and uploads a dump to `gv-db/hourly/`, and to `daily/` if that day has none.
 
 ## Secrets
@@ -28,4 +30,4 @@ make ec2-secrets NAME=tunnel-token              # prompts
 
 Alt tunnel with the same ingress as home for `gv` and `gv-api`, set through the API so their DNS records stay on home. Failover flips both CNAMEs to `<alt tunnel id>.cfargotunnel.com`.
 
-`gv-health.lab-ocp.com` always reaches home (`/health` only).
+`gv-health.lab-ocp.com` always reaches home (`/health` only). See [Cloudflare](Cloudflare.md).

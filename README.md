@@ -5,6 +5,7 @@ SAM stack (`eu-south-2`) for the home lab.
 | Doc                            | What                                    |
 |--------------------------------|-----------------------------------------|
 | [Lambdas](docs/Lambdas.md)     | Watchdog health check every 5 minutes   |
+| [Cloudflare](docs/Cloudflare.md) | Alt tunnel and the DNS flip              |
 | [S3](docs/S3.md)               | gv-api backup bucket and uploader user  |
 | [ECR](docs/Ecr.md)             | gv-api and gv-web images, deploy user   |
 | [EC2](docs/Ec2.md)             | Failover instance                       |
