@@ -9,6 +9,7 @@ Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=15min
 Restart=on-failure
+RestartPreventExitStatus=3
 RestartSec=30
 EnvironmentFile=/etc/gv.env
 ExecStartPre=/usr/bin/aws s3 sync s3://${BUCKET}/ec2/ /opt/gv/

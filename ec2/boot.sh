@@ -26,7 +26,7 @@ key=$(tr '\t' '\n' <<<"$keys" | { grep -E '/gv-db-[0-9]{8}T[0-9]{6}Z\.sql\.gz$' 
   | awk -F/ '{print $NF, $0}' | sort | tail -n 1 | cut -d' ' -f2)
 if [ -z "$key" ]; then
   echo "no dump in s3://$BUCKET/gv-db/" >&2
-  exit 1
+  exit 3
 fi
 
 echo "restoring $key"

@@ -43,6 +43,14 @@ Resources:
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
                 - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${FailoverInstance}
             - Effect: Allow
+              Action: ec2:DescribeInstances
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - ec2:StartInstances
+                - ec2:StopInstances
+              Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${FailoverInstance}
+            - Effect: Allow
               Action:
                 - ssm:GetCommandInvocation
                 - ssm:ListCommandInvocations
@@ -55,6 +63,9 @@ Resources:
               Resource:
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/*
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/state
       Events:
         Every5Min:
           Type: ScheduleV2
