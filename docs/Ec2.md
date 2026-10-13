@@ -14,7 +14,7 @@ Don't deploy during a failover: a newer AMI replaces the instance.
 
 No dump in S3 makes `boot.sh` exit 3 and `gv-boot.service` does not retry (any other failure retries every 30 s).
 
-Failback: `failback.sh` (Run Command) stops the apps and uploads a dump to `gv-db/hourly/`, and to `daily/` if that day has none.
+Failback: `failback.sh` (Run Command) stops the apps and uploads a dump to `gv-db/hourly/`, and to `daily/` if that day has none. Then it sets `dump` and `dump_ready` in `/home-lab-failover/state` (only while the state is `FAILING_BACK`); the instance role can read and write that one parameter.
 
 ## Secrets
 
@@ -30,4 +30,4 @@ make ec2-secrets NAME=tunnel-token              # prompts
 
 Alt tunnel with the same ingress as home for `gv` and `gv-api`, set through the API so their DNS records stay on home. Failover flips both CNAMEs to `<alt tunnel id>.cfargotunnel.com`.
 
-`gv-health.lab-ocp.com` always reaches home (`/health` only). See [Cloudflare](Cloudflare.md).
+`gv-health.lab-ocp.com` always reaches home and `gv-alt-health.lab-ocp.com` always reaches alt (`/health` only). See [Cloudflare](Cloudflare.md).

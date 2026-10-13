@@ -1,7 +1,7 @@
 BUCKET = $(shell aws cloudformation describe-stacks --region eu-south-2 --stack-name home-lab-failover \
 	--query "Stacks[0].Outputs[?OutputKey=='BackupBucketName'].OutputValue" --output text)
 
-.PHONY: help build local-run test deploy ec2-sync ec2-secrets hooks
+.PHONY: help build local-run test deploy ec2-sync ec2-secrets lambda-params hooks
 
 help:
 	@echo "make local-run  build and invoke the watchdog locally"
@@ -9,6 +9,7 @@ help:
 	@echo "make deploy     sync ec2/ to S3, build and deploy to AWS"
 	@echo "make ec2-sync   sync ec2/ to S3"
 	@echo "make ec2-secrets NAME=<name> [FILE=<path>]  SecureString /home-lab-failover/ec2/<name>, prompts without FILE"
+	@echo "make lambda-params  put the watchdog's SSM parameters from .env"
 	@echo "make hooks      run the tests before every commit"
 
 build:
@@ -36,6 +37,16 @@ else
 		aws ssm put-parameter --region eu-south-2 --overwrite --type SecureString \
 			--name /home-lab-failover/ec2/$(NAME) --value "$$v"
 endif
+
+lambda-params:
+	set -a; . ./.env; set +a; \
+	put() { aws ssm put-parameter --region eu-south-2 --overwrite --type "$$1" --name "/home-lab-failover/$$2" --value "$$3" > /dev/null; }; \
+	put SecureString cloudflare-token "$$CF_TOKEN"; \
+	put String cloudflare-zone "$$CF_ZONE"; \
+	put String alt-tunnel-id "$$ALT_TUNNEL_ID"; \
+	put String home-tunnel-id "$$HOME_TUNNEL_ID"; \
+	put SecureString telegram-token "$$TELEGRAM_TOKEN"; \
+	put String telegram-chat-id "$$TELEGRAM_CHAT_ID"
 
 hooks:
 	git config core.hooksPath .githooks

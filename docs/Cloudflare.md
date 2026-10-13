@@ -2,11 +2,11 @@
 
 Two tunnels serve `gv.lab-ocp.com` and `gv-api.lab-ocp.com`: home and alt (EC2, `gv-tunnel.service`). Their ingress is the same. Which one is live is decided by the two proxied CNAMEs, `<tunnel id>.cfargotunnel.com`.
 
-`gv-health.lab-ocp.com` always reaches home (`/health` only). There is no alt health hostname: after a flip, check `gv-api.lab-ocp.com/health`.
+`gv-health.lab-ocp.com` always reaches home and `gv-alt-health.lab-ocp.com` always reaches alt (`/health` only, both). The watchdog checks alt there before flipping.
 
 ## Flip
 
-`watchdog/cloudflare.py` `set_target(token, zone, tunnel_id)`:
+`Cloudflare(token, zone, tunnel_id).flip()` in `watchdog/app.py`:
 
 - flips `gv-api` first, then `gv`
 - does nothing for a record already on the target
@@ -17,7 +17,7 @@ From a laptop, with `.env` filled from `.env.example`:
 
 ```bash
 set -a; . ./.env; set +a
-python3 -I -c 'import os,sys; sys.path.insert(0,"."); from watchdog import cloudflare as c; print(c.set_target(os.environ["CF_TOKEN"], os.environ["CF_ZONE"], os.environ["ALT_TUNNEL_ID"]))'
+python3 -I -c 'import os,sys; sys.path.insert(0,"."); from watchdog import app; print(app.Cloudflare(os.environ["CF_TOKEN"], os.environ["CF_ZONE"], os.environ["ALT_TUNNEL_ID"]).flip())'
 ```
 
 Use `HOME_TUNNEL_ID` to go back. The instance must be running and restored first.

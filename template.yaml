@@ -19,7 +19,7 @@ Parameters:
 
 Globals:
   Function:
-    Timeout: 10
+    Timeout: 30
 
 Resources:
   WatchdogFunction:
@@ -33,6 +33,7 @@ Resources:
       Environment:
         Variables:
           HOME_LAB_API_URL: https://gv-health.lab-ocp.com
+          ALT_HEALTH_URL: https://gv-alt-health.lab-ocp.com
           FAILOVER_INSTANCE_ID: !Ref FailoverInstance 
       Policies:
         - Version: '2012-10-17'
@@ -213,6 +214,15 @@ Resources:
                 Resource:
                   - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/ec2
                   - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/ec2/*
+        - PolicyName: failback-state
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/state
 
   FailoverInstanceProfile:
     Type: AWS::IAM::InstanceProfile
