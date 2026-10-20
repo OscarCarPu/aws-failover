@@ -90,6 +90,10 @@ class State(str, Enum):
     HOME_READY = "HOME_READY"
 
 
+DUMP = "/home-lab-failover/dump"
+BASE = "/home-lab-failover/base"
+
+
 class States:
     state_ssm = "/home-lab-failover/state"
     down_after = 600  # seconds home must stay down before failing over
@@ -201,6 +205,8 @@ class States:
         if down_for < self.down_after:
             return state
 
+        self.ssm.delete_parameters(Names=[BASE, DUMP])
+
         self.ec2.start_instances(InstanceIds=[self.instance_id])
         return {**state, "state": State.STARTING}
 
@@ -227,6 +233,7 @@ class States:
         if up_for < self.up_after:
             return state
 
+        self.ssm.delete_parameters(Names=[DUMP])
         sent = self.ssm.send_command(
             InstanceIds=[self.instance_id],
             DocumentName="AWS-RunShellScript",
@@ -239,10 +246,12 @@ class States:
         }
 
     def failing_back(self, state, now):
-        """Only reruns a failed failback.sh. Anything else returns the state untouched,
-        so it never saves over the script's or the home agent's writes."""
-        if state.get("dump_ready"):
-            return state
+        """Waits for failback.sh; only reruns it when its command failed."""
+        try:
+            self.ssm.get_parameter(Name=DUMP)
+            return state  # TODO: PENDING_MERGE, once the merge exists
+        except self.ssm.exceptions.ParameterNotFound:
+            pass
 
         try:
             status = self.ssm.get_command_invocation(

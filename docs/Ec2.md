@@ -14,7 +14,9 @@ Don't deploy during a failover: a newer AMI replaces the instance.
 
 No dump in S3 makes `boot.sh` exit 3 and `gv-boot.service` does not retry (any other failure retries every 30 s).
 
-Failback: `failback.sh` (Run Command) stops the apps and uploads a dump to `gv-db/hourly/`, and to `daily/` if that day has none. Then it sets `dump` and `dump_ready` in `/home-lab-failover/state` (only while the state is `FAILING_BACK`); the instance role can read and write that one parameter.
+`boot.sh` writes the key it restored to `/home-lab-failover/base` the first time only (no `--overwrite`), so a reboot mid-failover keeps the dump home itself made. The Lambda deletes `base` and `dump` before it starts the instance.
+
+Failback: `failback.sh` (Run Command) stops the apps and uploads a dump to `gv-db/hourly/`, and to `daily/` if that day has none. Its last step puts that key in `/home-lab-failover/dump`; the parameter existing means the dump is ready. The instance role can only put `base` and `dump`; it never touches the state.
 
 ## Secrets
 

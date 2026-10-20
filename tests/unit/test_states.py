@@ -1,6 +1,7 @@
 import json
 import urllib.error
 from datetime import datetime, timedelta, timezone
+from typing import List
 
 import pytest
 
@@ -29,6 +30,7 @@ class FakeSSM:
         self.invocation = invocation
         self.sent = 0
         self.saved = []
+        self.deleted = []
 
     def get_parameter(self, Name, WithDecryption=False):
         if Name not in self.params:
@@ -47,6 +49,9 @@ class FakeSSM:
         if self.invocation is None:
             raise self.exceptions.InvocationDoesNotExist()
         return {"Status": self.invocation}
+
+    def delete_parameters(self, Names: List[str]):
+        self.deleted.append(Names)
 
 
 class FakeEC2:
@@ -87,7 +92,9 @@ def make(monkeypatch):
 
     def build(state=None, home=True, alt=True, ec2="running", invocation="Success"):
         ssm = FakeSSM(state, invocation)
-        states = app.States(ssm, FakeEC2(ec2), "i-1", "http://home/health", "http://alt/health")
+        states = app.States(
+            ssm, FakeEC2(ec2), "i-1", "http://home/health", "http://alt/health"
+        )
         checks = {"HOMELAB": home, "ALT": alt}
         monkeypatch.setattr(states, "check", lambda url, name: checks[name])
         states.sent = []
@@ -129,7 +136,12 @@ def test_check_ok(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
-    "kw", [{"exc": urllib.error.URLError("refused")}, {"exc": TimeoutError()}, {"status": 204}]
+    "kw",
+    [
+        {"exc": urllib.error.URLError("refused")},
+        {"exc": TimeoutError()},
+        {"status": 204},
+    ],
 )
 def test_check_down(monkeypatch, kw):
     fake_urlopen(monkeypatch, **kw)
@@ -202,6 +214,14 @@ def test_normal_recovery_resets_down_since(make):
     assert ssm.saved == [{"state": "NORMAL", "up_since": T0.isoformat()}]
 
 
+def test_normal_clears_base_and_dump_before_starting_ec2(make):
+    states, ssm = make({"state": "NORMAL", "down_since": iso(10)}, home=False)
+    seen = []
+    states.ec2.start_instances = lambda InstanceIds: seen.append(list(ssm.deleted))
+    states.run(T0)
+    assert seen == [[[app.BASE, app.DUMP]]]
+
+
 # starting
 
 
@@ -264,11 +284,28 @@ def test_failed_over_after_threshold_starts_failback(make):
     }
 
 
+def test_failed_over_clears_the_old_dump_before_failback(make):
+    states, ssm = make({"state": "FAILED_OVER", "up_since": iso(10)})
+    states.run(T0)
+    assert ssm.deleted == [[app.DUMP]]
+    assert ssm.sent == 1
+
+
 # failing_back
 
 
-def test_failing_back_dump_ready_waits_for_home(make):
-    states, ssm = make({"state": "FAILING_BACK", "dump_ready": True, "dump": "gv-db/hourly/x"})
+def test_failing_back_with_a_dump_waits_and_ignores_the_command(make):
+    states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
+    ssm.params[app.DUMP] = "gv-db/hourly/x"
+    states.run(T0)
+    assert ssm.saved == []
+    assert ssm.sent == 0
+
+
+def test_failing_back_without_a_dump_checks_the_command(make):
+    states, ssm = make(
+        {"state": "FAILING_BACK", "command_id": "cmd-0"}, invocation="InProgress"
+    )
     states.run(T0)
     assert ssm.saved == []
     assert ssm.sent == 0
@@ -276,7 +313,9 @@ def test_failing_back_dump_ready_waits_for_home(make):
 
 @pytest.mark.parametrize("status", ["Pending", "InProgress", "Delayed", "Success"])
 def test_failing_back_leaves_a_live_command_alone(make, status):
-    states, ssm = make({"state": "FAILING_BACK", "command_id": "cmd-0"}, invocation=status)
+    states, ssm = make(
+        {"state": "FAILING_BACK", "command_id": "cmd-0"}, invocation=status
+    )
     states.run(T0)
     assert ssm.saved == []
     assert ssm.sent == 0
@@ -284,7 +323,9 @@ def test_failing_back_leaves_a_live_command_alone(make, status):
 
 @pytest.mark.parametrize("invocation", ["Failed", "TimedOut", "Cancelled", None])
 def test_failing_back_reruns_a_failed_command(make, invocation):
-    states, ssm = make({"state": "FAILING_BACK", "command_id": "cmd-0"}, invocation=invocation)
+    states, ssm = make(
+        {"state": "FAILING_BACK", "command_id": "cmd-0"}, invocation=invocation
+    )
     states.run(T0)
     assert ssm.saved == [{"state": "FAILING_BACK", "command_id": "cmd-1"}]
 
@@ -300,7 +341,7 @@ def test_home_ready_waits_while_home_is_down(make):
 
 
 def test_home_ready_flips_stops_and_goes_normal(make):
-    states, ssm = make({"state": "HOME_READY", "dump": "gv-db/hourly/x", "dump_ready": True})
+    states, ssm = make({"state": "HOME_READY", "dump": "gv-db/hourly/x"})
     states.run(T0)
     assert FakeCloudflare.flips == ["home"]
     assert states.ec2.stopped == 1
@@ -390,9 +431,10 @@ def test_full_cycle(make, monkeypatch):
     ssm.invocation = "Success"
     failing = json.loads(ssm.params[app.States.state_ssm])
     failing.pop("command_id")
-    write({**failing, "dump": "gv-db/hourly/x", "dump_ready": True})
+    ssm.params[app.DUMP] = "gv-db/hourly/x"
     assert tick() == "FAILING_BACK"
     assert ssm.sent == 1
+    assert ssm.deleted == [[app.BASE, app.DUMP], [app.DUMP]]
 
     write({"state": "HOME_READY"})
     assert tick() == "NORMAL"
@@ -434,7 +476,10 @@ def cloudflare(monkeypatch, contents):
 def test_flip_api_first_then_web(monkeypatch):
     cf, fake = cloudflare(
         monkeypatch,
-        {"gv-api.lab-ocp.com": "h.cfargotunnel.com", "gv.lab-ocp.com": "h.cfargotunnel.com"},
+        {
+            "gv-api.lab-ocp.com": "h.cfargotunnel.com",
+            "gv.lab-ocp.com": "h.cfargotunnel.com",
+        },
     )
     assert cf.flip("alt") is True
     assert fake.patches == ["gv-api.lab-ocp.com", "gv.lab-ocp.com"]
@@ -443,7 +488,10 @@ def test_flip_api_first_then_web(monkeypatch):
 def test_flip_is_idempotent_and_finishes_a_half_flip(monkeypatch):
     cf, fake = cloudflare(
         monkeypatch,
-        {"gv-api.lab-ocp.com": "alt.cfargotunnel.com", "gv.lab-ocp.com": "h.cfargotunnel.com"},
+        {
+            "gv-api.lab-ocp.com": "alt.cfargotunnel.com",
+            "gv.lab-ocp.com": "h.cfargotunnel.com",
+        },
     )
     assert cf.flip("alt") is True
     assert fake.patches == ["gv.lab-ocp.com"]

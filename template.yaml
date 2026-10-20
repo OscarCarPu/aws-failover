@@ -67,6 +67,11 @@ Resources:
             - Effect: Allow
               Action: ssm:PutParameter
               Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/state
+            - Effect: Allow 
+              Action: ssm:DeleteParameters
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/base
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/dump
       Events:
         Every5Min:
           Type: ScheduleV2
@@ -220,9 +225,10 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - ssm:GetParameter
                   - ssm:PutParameter
-                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/state
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/dump
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/base
 
   FailoverInstanceProfile:
     Type: AWS::IAM::InstanceProfile

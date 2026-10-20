@@ -12,7 +12,7 @@
 
 Today it only logs the result. The state machine below is the target, from `gv-api/docs/features/CLOUD.md`.
 
-IAM already allows starting/stopping the instance, SSM Run Command and writing `/home-lab-failover/state`.
+IAM already allows starting/stopping the instance, SSM Run Command, writing `/home-lab-failover/state` and deleting `/home-lab-failover/base` and `dump`.
 
 ## Flow
 
@@ -27,7 +27,7 @@ NORMAL -> STARTING -> FAILED_OVER -> FAILING_BACK -> HOME_READY -> NORMAL
 | `NORMAL` | Checks home. After 10 minutes down: starts EC2, sets `STARTING`. |
 | `STARTING` | Waits until the instance is running and `gv-alt-health` answers 200 (the boot unit restored the DB and started the alt tunnel). Then flips both CNAMEs to alt, sets `FAILED_OVER`. Never checks home: once alt is ready it flips. Too long without getting ready fails the run. |
 | `FAILED_OVER` | Checks home. After 10 consecutive minutes healthy: sets `FAILING_BACK` and sends the first failback command. |
-| `FAILING_BACK` | `failback.sh` (started by `FAILED_OVER`) stops the apps on EC2, dumps the DB and sets `dump` (the S3 key) and `dump_ready` in the state itself. The Lambda only reruns the script if its Run Command failed. The home agent restores `dump` and sets the state parameter to `HOME_READY` itself. |
+| `FAILING_BACK` | `failback.sh` (started by `FAILED_OVER`, which first deletes `dump`) stops the apps on EC2, dumps the DB and puts the S3 key in the `dump` parameter. With `dump` present the Lambda waits. Without it, it reruns the script only if its Run Command failed. The home agent restores `dump` and sets the state parameter to `HOME_READY` itself. |
 | `HOME_READY` | Checks home first; if down, waits. Then flips both CNAMEs to home, stops EC2 (cloudflared goes with it) and sets `NORMAL`. |
 | `PLANNED` | Set from the gv-web maintenance button after a final backup. Home is shut down on purpose, so it is not read as an outage. |
 

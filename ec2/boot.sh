@@ -29,6 +29,8 @@ if [ -z "$key" ]; then
   exit 3
 fi
 
+aws ssm put-parameter --name /home-lab-failover/base --type String --value "$key" > /dev/null 2>&1 || true
+
 echo "restoring $key"
 aws s3 cp "s3://$BUCKET/$key" - | gunzip \
   | docker compose exec -T db sh -c 'psql -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
