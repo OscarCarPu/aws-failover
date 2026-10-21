@@ -88,6 +88,7 @@ class State(str, Enum):
     FAILED_OVER = "FAILED_OVER"
     FAILING_BACK = "FAILING_BACK"
     HOME_READY = "HOME_READY"
+    PENDING_MERGE = "PENDING_MERGE"
 
 
 DUMP = "/home-lab-failover/dump"
@@ -103,6 +104,9 @@ class States:
         (State.NORMAL, State.STARTING): "Home is down, starting the failover instance",
         (State.STARTING, State.FAILED_OVER): "Failed over to AWS",
         (State.FAILED_OVER, State.FAILING_BACK): "Home is back, failing back",
+        (State.FAILING_BACK, State.PENDING_MERGE): "Dump ready, home is merging it",
+        (State.PENDING_MERGE, State.HOME_READY): "Merge done on home",
+        (State.PENDING_MERGE, State.FAILED_OVER): "Home went down during the merge, back on failover",
         (State.HOME_READY, State.NORMAL): "Back on home, failover instance stopped",
     }
 
@@ -113,19 +117,24 @@ class States:
         instance_id,
         health_url,
         alt_health_url,
+        failover_url="https://gv-health.lab-ocp.com/failover",
     ):
         self.ssm = ssm
         self.ec2 = ec2
         self.instance_id = instance_id
         self.health_url = health_url
         self.alt_health_url = alt_health_url
+        self.failover_url = failover_url
         self.handlers = {
             State.NORMAL: self.normal,
             State.STARTING: self.starting,
             State.FAILED_OVER: self.failed_over,
             State.FAILING_BACK: self.failing_back,
+            State.PENDING_MERGE: self.pending_merge,
             State.HOME_READY: self.home_ready,
         }
+
+    # HELPERS
 
     def param(self, name):
         return self.ssm.get_parameter(
@@ -197,6 +206,45 @@ class States:
     def alt_healthy(self):
         return self.check(self.alt_health_url, "ALT")
 
+    def home_call(self, payload):
+        req = urllib.request.Request(
+            self.failover_url,
+            method="POST",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Failover-Token": self.param("failover-token"),
+                "User-Agent": "Mozilla/5.0 (compatible; AWS-Lambda/1.0)",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                acked = r.status == 200
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise RuntimeError(f"home refused the failover token ({e.code})") from e
+            acked = False
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            acked = False
+        print(f"HOME CALL {payload['mode']} {'ACK' if acked else 'NO ACK'}")
+        return acked
+
+    def home_status(self):
+        req = urllib.request.Request(
+            self.failover_url + "/status",
+            headers={
+                "X-Failover-Token": self.param("failover-token"),
+                "User-Agent": "Mozilla/5.0 (compatible; AWS-Lambda/1.0)",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.load(r)["merge"]
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            return None
+
+    # STATES
+
     def normal(self, state, now):
         if self.home_healthy(state, now):
             return state
@@ -229,6 +277,9 @@ class States:
         if not self.home_healthy(state, now):
             return state
 
+        if not state.get("home_held") and self.home_call({"mode": "hold"}):
+            state = {**state, "home_held": True}
+
         up_for = (now - datetime.fromisoformat(state["up_since"])).total_seconds()
         if up_for < self.up_after:
             return state
@@ -249,9 +300,13 @@ class States:
         """Waits for failback.sh; only reruns it when its command failed."""
         try:
             self.ssm.get_parameter(Name=DUMP)
-            return state  # TODO: PENDING_MERGE, once the merge exists
         except self.ssm.exceptions.ParameterNotFound:
             pass
+        else:
+            if not self.home_call({"mode": "merge"}):
+                return state
+            self.cloudflare.flip(self.param("home-tunnel-id"))
+            return {**state, "state": State.PENDING_MERGE, "merge_since": now.isoformat()}
 
         try:
             status = self.ssm.get_command_invocation(
@@ -269,6 +324,36 @@ class States:
         )
         return {**state, "command_id": sent["Command"]["CommandId"]}
 
+    def pending_merge(self, state, now):
+        """No timeout: only home going down again is a failure."""
+        status = self.home_status()
+        if status == "done":
+            return {**state, "state": State.HOME_READY}
+
+        if status == "needs_answers":
+            last = state.get("reminded_at")
+            if last and (now - datetime.fromisoformat(last)).total_seconds() < 3600:
+                return state
+            self.telegram.send_message("The merge is waiting for your answers (/merge)")
+            return {**state, "reminded_at": now.isoformat()}
+
+        if self.home_healthy(state, now):
+            return state
+        down_for = (now - datetime.fromisoformat(state["down_since"])).total_seconds()
+        if down_for < self.down_after:
+            return state
+
+        self.cloudflare.flip(self.param("alt-tunnel-id"))
+        self.ssm.send_command(
+            InstanceIds=[self.instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": ["cd /opt/gv && docker compose start gv-api gv-web"]},
+        )
+        self.ssm.delete_parameters(Names=[DUMP])
+        for key in ("home_held", "merge_since", "reminded_at", "command_id"):
+            state.pop(key, None)
+        return {**state, "state": State.FAILED_OVER}
+
     def home_ready(self, state, now):
         if not self.home_healthy(state, now):
             return state
@@ -285,6 +370,7 @@ def lambda_handler(event, context):
         os.environ["FAILOVER_INSTANCE_ID"],
         os.getenv("HOME_LAB_API_URL", "https://gv-api.lab-ocp.com") + "/health",
         os.getenv("ALT_HEALTH_URL", "https://gv-alt-health.lab-ocp.com") + "/health",
+        os.getenv("HOME_FAILOVER_URL", "https://gv-health.lab-ocp.com/failover"),
     )
     try:
         states.run(datetime.now(timezone.utc))

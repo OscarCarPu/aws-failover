@@ -46,7 +46,8 @@ lambda-params:
 	put String alt-tunnel-id "$$ALT_TUNNEL_ID"; \
 	put String home-tunnel-id "$$HOME_TUNNEL_ID"; \
 	put SecureString telegram-token "$$TELEGRAM_TOKEN"; \
-	put String telegram-chat-id "$$TELEGRAM_CHAT_ID"
+	put String telegram-chat-id "$$TELEGRAM_CHAT_ID"; \
+	put SecureString failover-token "$$FAILOVER_TOKEN"
 
 hooks:
 	git config core.hooksPath .githooks

@@ -4,6 +4,8 @@ Two tunnels serve `gv.lab-ocp.com` and `gv-api.lab-ocp.com`: home and alt (EC2, 
 
 `gv-health.lab-ocp.com` always reaches home and `gv-alt-health.lab-ocp.com` always reaches alt (`/health` only, both). The watchdog checks alt there before flipping.
 
+`gv-health` also routes `/failover*` to home's gv-api: the watchdog uses it to ask home to hold or merge during a failback (token in the `X-Failover-Token` header, see [Lambdas](Lambdas.md)). Do not route it on `gv-api.lab-ocp.com`: after the flip that hostname is public.
+
 ## Flip
 
 `Cloudflare(token, zone, tunnel_id).flip()` in `watchdog/app.py`:

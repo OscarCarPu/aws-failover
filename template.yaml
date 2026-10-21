@@ -19,7 +19,7 @@ Parameters:
 
 Globals:
   Function:
-    Timeout: 30
+    Timeout: 60
 
 Resources:
   WatchdogFunction:
@@ -34,7 +34,8 @@ Resources:
         Variables:
           HOME_LAB_API_URL: https://gv-health.lab-ocp.com
           ALT_HEALTH_URL: https://gv-alt-health.lab-ocp.com
-          FAILOVER_INSTANCE_ID: !Ref FailoverInstance 
+          HOME_FAILOVER_URL: https://gv-health.lab-ocp.com/failover
+          FAILOVER_INSTANCE_ID: !Ref FailoverInstance
       Policies:
         - Version: '2012-10-17'
           Statement: 
@@ -107,6 +108,23 @@ Resources:
                 Condition:
                   'Null':
                     's3:if-none-match': 'false'
+        - PolicyName: read-dumps
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${BackupBucket.Arn}/gv-db/*'
+        - PolicyName: read-failover-parameters
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/state
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/base
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/home-lab-failover/dump
 
   GvApiRepository:
     Type: AWS::ECR::Repository

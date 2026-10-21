@@ -97,6 +97,11 @@ def make(monkeypatch):
         )
         checks = {"HOMELAB": home, "ALT": alt}
         monkeypatch.setattr(states, "check", lambda url, name: checks[name])
+        states.calls = []
+        states.acked = True
+        states.status = None
+        states.home_call = lambda payload: states.calls.append(payload) or states.acked
+        states.home_status = lambda: states.status
         states.sent = []
         states.__dict__["telegram"] = FakeTelegram(states.sent)
         return states, ssm
@@ -269,7 +274,10 @@ def test_failed_over_unhealthy_restarts_the_window(make):
 def test_failed_over_first_healthy_sets_up_since(make):
     states, ssm = make({"state": "FAILED_OVER", "down_since": iso(60)})
     states.run(T0)
-    assert ssm.saved == [{"state": "FAILED_OVER", "up_since": T0.isoformat()}]
+    assert ssm.saved == [
+        {"state": "FAILED_OVER", "up_since": T0.isoformat(), "home_held": True}
+    ]
+    assert states.calls == [{"mode": "hold"}]
     assert ssm.sent == 0
 
 
@@ -280,6 +288,7 @@ def test_failed_over_after_threshold_starts_failback(make):
     assert ssm.saved[-1] == {
         "state": "FAILING_BACK",
         "up_since": iso(10),
+        "home_held": True,
         "command_id": "cmd-1",
     }
 
@@ -294,12 +303,68 @@ def test_failed_over_clears_the_old_dump_before_failback(make):
 # failing_back
 
 
-def test_failing_back_with_a_dump_waits_and_ignores_the_command(make):
+def test_failing_back_with_a_dump_asks_home_to_merge_and_flips(make):
     states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
     ssm.params[app.DUMP] = "gv-db/hourly/x"
     states.run(T0)
-    assert ssm.saved == []
+    assert states.calls == [{"mode": "merge"}]
+    assert FakeCloudflare.flips == ["home"]
+    assert ssm.saved[-1]["state"] == "PENDING_MERGE"
     assert ssm.sent == 0
+
+
+def test_failing_back_without_an_ack_does_not_flip(make):
+    states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
+    ssm.params[app.DUMP] = "gv-db/hourly/x"
+    states.acked = False
+    states.run(T0)
+    assert FakeCloudflare.flips == []
+    assert ssm.saved == []
+
+
+# pending_merge
+
+
+def test_pending_merge_done_goes_home_ready(make):
+    states, ssm = make({"state": "PENDING_MERGE"})
+    states.status = "done"
+    states.run(T0)
+    assert ssm.saved[-1]["state"] == "HOME_READY"
+
+
+def test_pending_merge_waits_while_home_merges(make):
+    states, ssm = make({"state": "PENDING_MERGE", "up_since": iso(5)})
+    states.status = "running"
+    states.run(T0)
+    assert ssm.saved == []
+
+
+def test_pending_merge_reminds_once_an_hour(make):
+    states, ssm = make({"state": "PENDING_MERGE"})
+    states.status = "needs_answers"
+    states.run(T0)
+    states.run(T0 + timedelta(minutes=5))
+    assert len(states.sent) == 1
+    assert "reminded_at" in ssm.saved[-1]
+
+
+def test_pending_merge_home_down_briefly_waits(make):
+    states, ssm = make({"state": "PENDING_MERGE", "down_since": iso(3)}, home=False)
+    states.run(T0)
+    assert FakeCloudflare.flips == []
+    assert ssm.sent == 0
+
+
+def test_pending_merge_home_down_rolls_back_to_the_instance(make):
+    states, ssm = make(
+        {"state": "PENDING_MERGE", "down_since": iso(11), "home_held": True}, home=False
+    )
+    states.run(T0)
+    assert FakeCloudflare.flips == ["alt"]
+    assert ssm.sent == 1
+    assert ssm.deleted == [[app.DUMP]]
+    assert ssm.saved[-1]["state"] == "FAILED_OVER"
+    assert "home_held" not in ssm.saved[-1]
 
 
 def test_failing_back_without_a_dump_checks_the_command(make):
@@ -432,19 +497,27 @@ def test_full_cycle(make, monkeypatch):
     failing = json.loads(ssm.params[app.States.state_ssm])
     failing.pop("command_id")
     ssm.params[app.DUMP] = "gv-db/hourly/x"
-    assert tick() == "FAILING_BACK"
+    assert tick() == "PENDING_MERGE"
+    assert states.calls[-1] == {"mode": "merge"}
     assert ssm.sent == 1
     assert ssm.deleted == [[app.BASE, app.DUMP], [app.DUMP]]
-
-    write({"state": "HOME_READY"})
-    assert tick() == "NORMAL"
     assert FakeCloudflare.flips == ["alt", "home"]
+
+    states.status = "running"
+    assert tick() == "PENDING_MERGE"
+    states.status = "done"
+    assert tick() == "HOME_READY"
+
+    assert tick() == "NORMAL"
+    assert FakeCloudflare.flips == ["alt", "home", "home"]
     assert states.ec2.stopped == 1
 
     assert states.sent == [
         "Home is down, starting the failover instance",
         "Failed over to AWS",
         "Home is back, failing back",
+        "Dump ready, home is merging it",
+        "Merge done on home",
         "Back on home, failover instance stopped",
     ]
 
