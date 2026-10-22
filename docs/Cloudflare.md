@@ -8,7 +8,7 @@ Two tunnels serve `gv.lab-ocp.com` and `gv-api.lab-ocp.com`: home and alt (EC2, 
 
 ## Flip
 
-`Cloudflare(token, zone, tunnel_id).flip()` in `watchdog/app.py`:
+`Cloudflare(token, zone, tunnel_id).flip()` in `watchdog/clients.py`:
 
 - flips `gv-api` first, then `gv`
 - does nothing for a record already on the target
@@ -19,7 +19,7 @@ From a laptop, with `.env` filled from `.env.example`:
 
 ```bash
 set -a; . ./.env; set +a
-python3 -I -c 'import os,sys; sys.path.insert(0,"."); from watchdog import app; print(app.Cloudflare(os.environ["CF_TOKEN"], os.environ["CF_ZONE"], os.environ["ALT_TUNNEL_ID"]).flip())'
+python3 -I -c 'import os,sys; sys.path.insert(0,"watchdog"); from clients import Cloudflare; print(Cloudflare(os.environ["CF_TOKEN"], os.environ["CF_ZONE"], os.environ["ALT_TUNNEL_ID"]).flip())'
 ```
 
 Use `HOME_TUNNEL_ID` to go back. The instance must be running and restored first.

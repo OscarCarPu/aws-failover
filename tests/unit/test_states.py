@@ -5,7 +5,7 @@ from typing import List
 
 import pytest
 
-from watchdog import app
+import clients
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -26,7 +26,7 @@ class FakeSSM:
             "/home-lab-failover/home-tunnel-id": "home",
         }
         if state is not None:
-            self.params[app.StateStore.state_name] = json.dumps(state)
+            self.params[clients.StateStore.state_name] = json.dumps(state)
         self.invocation = invocation
         self.sent = 0
         self.saved = []
@@ -107,13 +107,13 @@ class FakeHome:
 @pytest.fixture
 def make(monkeypatch):
     FakeCloudflare.flips = []
-    monkeypatch.setattr(app, "Cloudflare", FakeCloudflare)
+    monkeypatch.setattr(clients, "Cloudflare", FakeCloudflare)
 
     def build(state=None, home=True, alt=True, ec2="running", invocation="Success"):
         ssm = FakeSSM(state, invocation)
-        states = app.States(
-            app.StateStore(ssm),
-            app.Instance(ssm, FakeEC2(ec2), "i-1"),
+        states = clients.States(
+            clients.StateStore(ssm),
+            clients.Instance(ssm, FakeEC2(ec2), "i-1"),
             "http://home/health",
             "http://alt/health",
         )
@@ -147,11 +147,11 @@ def fake_urlopen(monkeypatch, status=200, exc=None):
             raise exc
         return Resp()
 
-    monkeypatch.setattr(app.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(clients.urllib.request, "urlopen", urlopen)
 
 
 def checker():
-    return app.HomeClient("http://home/failover", "tok")
+    return clients.HomeClient("http://home/failover", "tok")
 
 
 def test_check_ok(monkeypatch, capsys):
@@ -244,7 +244,7 @@ def test_normal_clears_base_and_dump_before_starting_ec2(make):
     seen = []
     states.instance.ec2.start_instances = lambda InstanceIds: seen.append(list(ssm.deleted))
     states.run(T0)
-    assert seen == [[[app.StateStore.base_name, app.StateStore.dump_name]]]
+    assert seen == [[[clients.StateStore.base_name, clients.StateStore.dump_name]]]
 
 
 # starting
@@ -314,7 +314,7 @@ def test_failed_over_after_threshold_starts_failback(make):
 def test_failed_over_clears_the_old_dump_before_failback(make):
     states, ssm = make({"state": "FAILED_OVER", "up_since": iso(10)})
     states.run(T0)
-    assert ssm.deleted == [[app.StateStore.dump_name]]
+    assert ssm.deleted == [[clients.StateStore.dump_name]]
     assert ssm.sent == 1
 
 
@@ -323,7 +323,7 @@ def test_failed_over_clears_the_old_dump_before_failback(make):
 
 def test_failing_back_with_a_dump_asks_home_to_merge_and_flips(make):
     states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
-    ssm.params[app.StateStore.dump_name] = "gv-db/hourly/x"
+    ssm.params[clients.StateStore.dump_name] = "gv-db/hourly/x"
     states.run(T0)
     assert states.home.calls == [{"mode": "merge"}]
     assert FakeCloudflare.flips == ["home"]
@@ -333,7 +333,7 @@ def test_failing_back_with_a_dump_asks_home_to_merge_and_flips(make):
 
 def test_failing_back_without_an_ack_does_not_flip(make):
     states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
-    ssm.params[app.StateStore.dump_name] = "gv-db/hourly/x"
+    ssm.params[clients.StateStore.dump_name] = "gv-db/hourly/x"
     states.home.acked = False
     states.run(T0)
     assert FakeCloudflare.flips == []
@@ -380,7 +380,7 @@ def test_pending_merge_home_down_rolls_back_to_the_instance(make):
     states.run(T0)
     assert FakeCloudflare.flips == ["alt"]
     assert ssm.sent == 1
-    assert ssm.deleted == [[app.StateStore.dump_name]]
+    assert ssm.deleted == [[clients.StateStore.dump_name]]
     assert ssm.saved[-1]["state"] == "FAILED_OVER"
     assert "home_held" not in ssm.saved[-1]
 
@@ -453,8 +453,8 @@ def test_send_message_posts_to_the_bot(monkeypatch):
         seen["url"] = req.full_url
         seen["body"] = json.loads(req.data)
 
-    monkeypatch.setattr(app.urllib.request, "urlopen", urlopen)
-    app.Telegram("tok", "42").send_message("hi")
+    monkeypatch.setattr(clients.urllib.request, "urlopen", urlopen)
+    clients.Telegram("tok", "42").send_message("hi")
     assert seen == {
         "url": "https://api.telegram.org/bottok/sendMessage",
         "body": {"chat_id": "42", "text": "hi"},
@@ -465,8 +465,8 @@ def test_send_message_failure_is_only_logged(monkeypatch, capsys):
     def boom(req, timeout):
         raise urllib.error.URLError("down")
 
-    monkeypatch.setattr(app.urllib.request, "urlopen", boom)
-    app.Telegram("tok", "42").send_message("hi")
+    monkeypatch.setattr(clients.urllib.request, "urlopen", boom)
+    clients.Telegram("tok", "42").send_message("hi")
     assert "TELEGRAM ERROR" in capsys.readouterr().out
 
 
@@ -481,10 +481,10 @@ def test_full_cycle(make):
     def tick():
         states.run(T0 + timedelta(minutes=clock["minutes"]))
         clock["minutes"] += 5
-        return json.loads(ssm.params[app.StateStore.state_name])["state"]
+        return json.loads(ssm.params[clients.StateStore.state_name])["state"]
 
     def write(state):
-        ssm.params[app.StateStore.state_name] = json.dumps(state)
+        ssm.params[clients.StateStore.state_name] = json.dumps(state)
 
     assert tick() == "NORMAL"
 
@@ -504,20 +504,20 @@ def test_full_cycle(make):
     checks["HOMELAB"] = True
     assert [tick(), tick(), tick()] == ["FAILED_OVER", "FAILED_OVER", "FAILING_BACK"]
     assert ssm.sent == 1
-    assert json.loads(ssm.params[app.StateStore.state_name])["command_id"] == "cmd-1"
+    assert json.loads(ssm.params[clients.StateStore.state_name])["command_id"] == "cmd-1"
 
     ssm.invocation = "InProgress"
     assert tick() == "FAILING_BACK"
     assert ssm.sent == 1
 
     ssm.invocation = "Success"
-    failing = json.loads(ssm.params[app.StateStore.state_name])
+    failing = json.loads(ssm.params[clients.StateStore.state_name])
     failing.pop("command_id")
-    ssm.params[app.StateStore.dump_name] = "gv-db/hourly/x"
+    ssm.params[clients.StateStore.dump_name] = "gv-db/hourly/x"
     assert tick() == "PENDING_MERGE"
     assert states.home.calls[-1] == {"mode": "merge"}
     assert ssm.sent == 1
-    assert ssm.deleted == [[app.StateStore.base_name, app.StateStore.dump_name], [app.StateStore.dump_name]]
+    assert ssm.deleted == [[clients.StateStore.base_name, clients.StateStore.dump_name], [clients.StateStore.dump_name]]
     assert FakeCloudflare.flips == ["alt", "home"]
 
     states.home.status = "running"
@@ -557,7 +557,7 @@ class FakeCall:
 
 
 def cloudflare(monkeypatch, contents):
-    cf = app.Cloudflare("t", "z")
+    cf = clients.Cloudflare("t", "z")
     fake = FakeCall(contents)
     monkeypatch.setattr(cf, "call", fake)
     return cf, fake
@@ -598,8 +598,8 @@ def test_flip_missing_record_raises(monkeypatch):
 
 
 def test_snapshot_json_roundtrip_and_omits_defaults():
-    snap = app.Snapshot(
-        app.State.FAILING_BACK, up_since=T0, home_held=True, command_id="cmd-1"
+    snap = clients.Snapshot(
+        clients.State.FAILING_BACK, up_since=T0, home_held=True, command_id="cmd-1"
     )
     raw = snap.to_json()
     assert raw == {
@@ -608,11 +608,27 @@ def test_snapshot_json_roundtrip_and_omits_defaults():
         "home_held": True,
         "command_id": "cmd-1",
     }
-    assert app.Snapshot.from_json(raw) == snap
+    assert clients.Snapshot.from_json(raw) == snap
 
 
 def test_snapshot_seen_starts_one_streak_and_ends_the_other():
-    snap = app.Snapshot(app.State.NORMAL, up_since=T0)
+    snap = clients.Snapshot(clients.State.NORMAL, up_since=T0)
     down = snap.seen(False, T0 + timedelta(minutes=5))
     assert down.up_since is None and down.down_since == T0 + timedelta(minutes=5)
     assert down.seen(False, T0 + timedelta(minutes=9)).down_since == down.down_since
+
+
+# build_states
+
+
+def test_build_states_wires_the_clients_from_env():
+    import app
+
+    ssm = FakeSSM()
+    states = app.build_states(
+        {"FAILOVER_INSTANCE_ID": "i-9", "HOME_LAB_API_URL": "http://h"}, ssm, FakeEC2()
+    )
+    assert states.store.ssm is ssm
+    assert states.instance.instance_id == "i-9"
+    assert states.health_url == "http://h/health"
+    assert states.alt_health_url == "https://gv-alt-health.lab-ocp.com/health"

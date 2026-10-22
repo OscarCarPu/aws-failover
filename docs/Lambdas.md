@@ -56,7 +56,7 @@ SSM parameters under `/home-lab-failover/`:
 
 ## DNS flip
 
-`Cloudflare.flip()` in `watchdog/app.py` points `gv-api` and `gv` at a tunnel (`<tunnel id>.cfargotunnel.com`), see [Cloudflare](Cloudflare.md). `STARTING` flips to alt, `HOME_READY` flips back to home. The token, zone and tunnel ids are read from SSM only when a state flips.
+`Cloudflare.flip()` in `watchdog/clients.py` points `gv-api` and `gv` at a tunnel (`<tunnel id>.cfargotunnel.com`), see [Cloudflare](Cloudflare.md). `STARTING` flips to alt, `HOME_READY` flips back to home. The token, zone and tunnel ids are read from SSM only when a state flips.
 
 ## Telegram
 
