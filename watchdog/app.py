@@ -154,12 +154,53 @@ class State(str, Enum):
     PENDING_MERGE = "PENDING_MERGE"
 
 
-DUMP = "/home-lab-failover/dump"
-BASE = "/home-lab-failover/base"
+class StateStore:
+    prefix = "/home-lab-failover"
+    state_name = f"{prefix}/state"
+    dump_name = f"{prefix}/dump"
+    base_name = f"{prefix}/base"
+
+    def __init__(self, ssm):
+        self.ssm = ssm
+
+    def param(self, name):
+        return self.ssm.get_parameter(
+            Name=f"{self.prefix}/{name}", WithDecryption=True
+        )["Parameter"]["Value"]
+
+    def load(self):
+        try:
+            raw = json.loads(
+                self.ssm.get_parameter(Name=self.state_name)["Parameter"]["Value"]
+            )
+        except self.ssm.exceptions.ParameterNotFound:
+            return {"state": State.NORMAL}
+        return {**raw, "state": State(raw["state"])}
+
+    def save(self, state):
+        self.ssm.put_parameter(
+            Name=self.state_name,
+            Value=json.dumps(state),
+            Type="String",
+            Overwrite=True,
+        )
+
+    def dump_ready(self):
+        try:
+            self.ssm.get_parameter(Name=self.dump_name)
+        except self.ssm.exceptions.ParameterNotFound:
+            return False
+        return True
+
+    def clear_dump(self):
+        self.ssm.delete_parameters(Names=[self.dump_name])
+
+    def clear_handoff(self):
+        """Drops base and dump so a new failover starts from nothing."""
+        self.ssm.delete_parameters(Names=[self.base_name, self.dump_name])
 
 
 class States:
-    state_ssm = "/home-lab-failover/state"
     down_after = 600  # seconds home must stay down before failing over
     up_after = 600  # seconds home must stay healthy before failing back
     starting_timeout = 2400
@@ -178,6 +219,7 @@ class States:
 
     def __init__(
         self,
+        store,
         ssm,
         ec2,
         instance_id,
@@ -185,6 +227,7 @@ class States:
         alt_health_url,
         failover_url="https://gv-health.lab-ocp.com/failover",
     ):
+        self.store = store
         self.ssm = ssm
         self.ec2 = ec2
         self.instance_id = instance_id
@@ -201,45 +244,27 @@ class States:
         }
 
     # HELPERS
-    def param(self, name):
-        return self.ssm.get_parameter(
-            Name=f"/home-lab-failover/{name}", WithDecryption=True
-        )["Parameter"]["Value"]
-
     @cached_property
     def cloudflare(self):
-        return Cloudflare(self.param("cloudflare-token"), self.param("cloudflare-zone"))
+        return Cloudflare(
+            self.store.param("cloudflare-token"), self.store.param("cloudflare-zone")
+        )
 
     @cached_property
     def telegram(self):
-        return Telegram(self.param("telegram-token"), self.param("telegram-chat-id"))
+        return Telegram(
+            self.store.param("telegram-token"), self.store.param("telegram-chat-id")
+        )
 
     @cached_property
     def home(self):
-        return HomeClient(self.failover_url, self.param("failover-token"))
-
-    def load(self):
-        try:
-            raw = json.loads(
-                self.ssm.get_parameter(Name=self.state_ssm)["Parameter"]["Value"]
-            )
-        except self.ssm.exceptions.ParameterNotFound:
-            return {"state": State.NORMAL}
-        return {**raw, "state": State(raw["state"])}
-
-    def save(self, state):
-        self.ssm.put_parameter(
-            Name=self.state_ssm,
-            Value=json.dumps(state),
-            Type="String",
-            Overwrite=True,
-        )
+        return HomeClient(self.failover_url, self.store.param("failover-token"))
 
     def run(self, now):
-        state = self.load()
+        state = self.store.load()
         new = self.handlers[state["state"]](dict(state), now)
         if new != state:
-            self.save(new)
+            self.store.save(new)
         print(f"STATE {state['state'].value} -> {new['state'].value}")
         text = self.messages.get((state["state"], new["state"]))
         if text:
@@ -269,7 +294,7 @@ class States:
         if down_for < self.down_after:
             return state
 
-        self.ssm.delete_parameters(Names=[BASE, DUMP])
+        self.store.clear_handoff()
 
         self.ec2.start_instances(InstanceIds=[self.instance_id])
         return {**state, "state": State.STARTING}
@@ -286,7 +311,7 @@ class States:
         if name != "running" or not self.alt_healthy():
             return state
 
-        self.cloudflare.flip(self.param("alt-tunnel-id"))
+        self.cloudflare.flip(self.store.param("alt-tunnel-id"))
         return {**state, "state": State.FAILED_OVER}
 
     def failed_over(self, state, now):
@@ -300,7 +325,7 @@ class States:
         if up_for < self.up_after:
             return state
 
-        self.ssm.delete_parameters(Names=[DUMP])
+        self.store.clear_dump()
         sent = self.ssm.send_command(
             InstanceIds=[self.instance_id],
             DocumentName="AWS-RunShellScript",
@@ -314,14 +339,10 @@ class States:
 
     def failing_back(self, state, now):
         """Waits for failback.sh; only reruns it when its command failed."""
-        try:
-            self.ssm.get_parameter(Name=DUMP)
-        except self.ssm.exceptions.ParameterNotFound:
-            pass
-        else:
+        if self.store.dump_ready():
             if not self.home.home_call({"mode": "merge"}):
                 return state
-            self.cloudflare.flip(self.param("home-tunnel-id"))
+            self.cloudflare.flip(self.store.param("home-tunnel-id"))
             return {
                 **state,
                 "state": State.PENDING_MERGE,
@@ -363,7 +384,7 @@ class States:
         if down_for < self.down_after:
             return state
 
-        self.cloudflare.flip(self.param("alt-tunnel-id"))
+        self.cloudflare.flip(self.store.param("alt-tunnel-id"))
         self.ssm.send_command(
             InstanceIds=[self.instance_id],
             DocumentName="AWS-RunShellScript",
@@ -371,7 +392,7 @@ class States:
                 "commands": ["cd /opt/gv && docker compose start gv-api gv-web"]
             },
         )
-        self.ssm.delete_parameters(Names=[DUMP])
+        self.store.clear_dump()
         for key in ("home_held", "merge_since", "reminded_at", "command_id"):
             state.pop(key, None)
         return {**state, "state": State.FAILED_OVER}
@@ -380,14 +401,16 @@ class States:
         if not self.home_healthy(state, now):
             return state
 
-        self.cloudflare.flip(self.param("home-tunnel-id"))
+        self.cloudflare.flip(self.store.param("home-tunnel-id"))
         self.ec2.stop_instances(InstanceIds=[self.instance_id])
         return {"state": State.NORMAL}
 
 
 def lambda_handler(event, context):
+    ssm = boto3.client("ssm")
     states = States(
-        boto3.client("ssm"),
+        StateStore(ssm),
+        ssm,
         boto3.client("ec2"),
         os.environ["FAILOVER_INSTANCE_ID"],
         os.getenv("HOME_LAB_API_URL", "https://gv-api.lab-ocp.com") + "/health",
