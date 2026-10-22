@@ -154,6 +154,11 @@ class State(str, Enum):
     PENDING_MERGE = "PENDING_MERGE"
 
 
+def elapsed(ts, now):
+    """Seconds between an ISO timestamp and now."""
+    return (now - datetime.fromisoformat(ts)).total_seconds()
+
+
 class StateStore:
     prefix = "/home-lab-failover"
     state_name = f"{prefix}/state"
@@ -316,17 +321,19 @@ class States:
         state.setdefault(here, now.isoformat())
         return healthy
 
+    def home_down_long_enough(self, state, now):
+        """Checks home (see home_healthy); True once it has been down for down_after."""
+        if self.home_healthy(state, now):
+            return False
+        return elapsed(state["down_since"], now) >= self.down_after
+
     def alt_healthy(self):
         return self.home.check(self.alt_health_url, "ALT")
 
     # STATES
 
     def normal(self, state, now):
-        if self.home_healthy(state, now):
-            return state
-
-        down_for = (now - datetime.fromisoformat(state["down_since"])).total_seconds()
-        if down_for < self.down_after:
+        if not self.home_down_long_enough(state, now):
             return state
 
         self.store.clear_handoff()
@@ -335,7 +342,7 @@ class States:
         return {**state, "state": State.STARTING}
 
     def starting(self, state, now):
-        waited = (now - datetime.fromisoformat(state["down_since"])).total_seconds()
+        waited = elapsed(state["down_since"], now)
         if waited > self.starting_timeout:
             raise RuntimeError(f"alt not healthy after {waited:.0f}s")
         name = self.instance.power()
@@ -355,8 +362,7 @@ class States:
         if not state.get("home_held") and self.home.home_call({"mode": "hold"}):
             state = {**state, "home_held": True}
 
-        up_for = (now - datetime.fromisoformat(state["up_since"])).total_seconds()
-        if up_for < self.up_after:
+        if elapsed(state["up_since"], now) < self.up_after:
             return state
 
         self.store.clear_dump()
@@ -389,15 +395,12 @@ class States:
 
         if status == "needs_answers":
             last = state.get("reminded_at")
-            if last and (now - datetime.fromisoformat(last)).total_seconds() < 3600:
+            if last and elapsed(last, now) < 3600:
                 return state
             self.telegram.send_message("The merge is waiting for your answers (/merge)")
             return {**state, "reminded_at": now.isoformat()}
 
-        if self.home_healthy(state, now):
-            return state
-        down_for = (now - datetime.fromisoformat(state["down_since"])).total_seconds()
-        if down_for < self.down_after:
+        if not self.home_down_long_enough(state, now):
             return state
 
         self.cloudflare.flip(self.store.param("alt-tunnel-id"))
