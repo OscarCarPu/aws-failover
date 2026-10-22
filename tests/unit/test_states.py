@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,14 @@ class FakeSSM:
             raise self.exceptions.ParameterNotFound()
         return {"Parameter": {"Value": self.params[Name]}}
 
+    def get_parameters_by_path(self, Path, WithDecryption=False, NextToken=None):
+        found = [
+            {"Name": k, "Value": v}
+            for k, v in self.params.items()
+            if k.startswith(Path + "/") and "/" not in k[len(Path) + 1 :]
+        ]
+        return {"Parameters": found}
+
     def put_parameter(self, Name, Value, **kw):
         self.params[Name] = Value
         self.saved.append(json.loads(Value))
@@ -70,31 +79,35 @@ class FakeEC2:
         self.stopped += 1
 
 
-class FakeCloudflare:
+class FakeTunnels:
     flips = []
 
-    def __init__(self, token, zone):
-        pass
+    def to_alt(self):
+        self.flips.append("alt")
 
-    def flip(self, tunnel_id):
-        self.flips.append(tunnel_id)
+    def to_home(self):
+        self.flips.append("home")
 
 
 class FakeTelegram:
     def __init__(self, sent):
         self.send_message = sent.append
 
-class FakeHome:
+class FakeHealth:
     def __init__(self, home=True, alt=True):
         self.checks = {"HOMELAB": home, "ALT": alt}
         self.checked = []
-        self.calls = []
-        self.acked = True
-        self.status = None
 
     def check(self, url, name):
         self.checked.append(name)
         return self.checks[name]
+
+
+class FakeHome:
+    def __init__(self):
+        self.calls = []
+        self.acked = True
+        self.status = None
 
     def home_call(self, payload):
         self.calls.append(payload)
@@ -105,21 +118,23 @@ class FakeHome:
 
 
 @pytest.fixture
-def make(monkeypatch):
-    FakeCloudflare.flips = []
-    monkeypatch.setattr(clients, "Cloudflare", FakeCloudflare)
+def make():
+    FakeTunnels.flips = []
 
     def build(state=None, home=True, alt=True, ec2="running", invocation="Success"):
         ssm = FakeSSM(state, invocation)
+        sent = []
         states = clients.States(
             clients.StateStore(ssm),
             clients.Instance(ssm, FakeEC2(ec2), "i-1"),
+            FakeHealth(home, alt),
+            FakeHome(),
+            FakeTunnels(),
+            FakeTelegram(sent),
             "http://home/health",
             "http://alt/health",
         )
-        states.__dict__["home"] = FakeHome(home, alt)
-        states.sent = []
-        states.__dict__["telegram"] = FakeTelegram(states.sent)
+        states.sent = sent
         return states, ssm
 
     return build
@@ -151,7 +166,7 @@ def fake_urlopen(monkeypatch, status=200, exc=None):
 
 
 def checker():
-    return clients.HomeClient("http://home/failover", "tok")
+    return clients.HealthCheck()
 
 
 def test_check_ok(monkeypatch, capsys):
@@ -262,14 +277,14 @@ def test_starting_waits(make, kw):
     states, ssm = make({"state": "STARTING", "down_since": iso(15)}, **kw)
     states.run(T0)
     assert ssm.saved == []
-    assert FakeCloudflare.flips == []
+    assert FakeTunnels.flips == []
 
 
 def test_starting_flips_when_alt_is_healthy_without_checking_home(make):
     states, ssm = make({"state": "STARTING", "down_since": iso(15)}, home=False)
     states.run(T0)
-    assert states.home.checked == ["ALT"]
-    assert FakeCloudflare.flips == ["alt"]
+    assert states.health.checked == ["ALT"]
+    assert FakeTunnels.flips == ["alt"]
     assert ssm.saved[-1]["state"] == "FAILED_OVER"
 
 
@@ -326,7 +341,7 @@ def test_failing_back_with_a_dump_asks_home_to_merge_and_flips(make):
     ssm.params[clients.StateStore.dump_name] = "gv-db/hourly/x"
     states.run(T0)
     assert states.home.calls == [{"mode": "merge"}]
-    assert FakeCloudflare.flips == ["home"]
+    assert FakeTunnels.flips == ["home"]
     assert ssm.saved[-1]["state"] == "PENDING_MERGE"
     assert ssm.sent == 0
 
@@ -336,7 +351,7 @@ def test_failing_back_without_an_ack_does_not_flip(make):
     ssm.params[clients.StateStore.dump_name] = "gv-db/hourly/x"
     states.home.acked = False
     states.run(T0)
-    assert FakeCloudflare.flips == []
+    assert FakeTunnels.flips == []
     assert ssm.saved == []
 
 
@@ -369,7 +384,7 @@ def test_pending_merge_reminds_once_an_hour(make):
 def test_pending_merge_home_down_briefly_waits(make):
     states, ssm = make({"state": "PENDING_MERGE", "down_since": iso(3)}, home=False)
     states.run(T0)
-    assert FakeCloudflare.flips == []
+    assert FakeTunnels.flips == []
     assert ssm.sent == 0
 
 
@@ -378,7 +393,7 @@ def test_pending_merge_home_down_rolls_back_to_the_instance(make):
         {"state": "PENDING_MERGE", "down_since": iso(11), "home_held": True}, home=False
     )
     states.run(T0)
-    assert FakeCloudflare.flips == ["alt"]
+    assert FakeTunnels.flips == ["alt"]
     assert ssm.sent == 1
     assert ssm.deleted == [[clients.StateStore.dump_name]]
     assert ssm.saved[-1]["state"] == "FAILED_OVER"
@@ -419,14 +434,14 @@ def test_failing_back_reruns_a_failed_command(make, invocation):
 def test_home_ready_waits_while_home_is_down(make):
     states, ssm = make({"state": "HOME_READY"}, home=False)
     states.run(T0)
-    assert FakeCloudflare.flips == []
+    assert FakeTunnels.flips == []
     assert states.instance.ec2.stopped == 0
 
 
 def test_home_ready_flips_stops_and_goes_normal(make):
     states, ssm = make({"state": "HOME_READY", "dump": "gv-db/hourly/x"})
     states.run(T0)
-    assert FakeCloudflare.flips == ["home"]
+    assert FakeTunnels.flips == ["home"]
     assert states.instance.ec2.stopped == 1
     assert ssm.saved == [{"state": "NORMAL"}]
 
@@ -475,7 +490,7 @@ def test_send_message_failure_is_only_logged(monkeypatch, capsys):
 
 def test_full_cycle(make):
     states, ssm = make(alt=False)
-    checks = states.home.checks
+    checks = states.health.checks
     clock = {"minutes": 0}
 
     def tick():
@@ -498,7 +513,7 @@ def test_full_cycle(make):
     assert tick() == "STARTING"
     checks["ALT"] = True
     assert tick() == "FAILED_OVER"
-    assert FakeCloudflare.flips == ["alt"]
+    assert FakeTunnels.flips == ["alt"]
 
     assert tick() == "FAILED_OVER"
     checks["HOMELAB"] = True
@@ -518,7 +533,7 @@ def test_full_cycle(make):
     assert states.home.calls[-1] == {"mode": "merge"}
     assert ssm.sent == 1
     assert ssm.deleted == [[clients.StateStore.base_name, clients.StateStore.dump_name], [clients.StateStore.dump_name]]
-    assert FakeCloudflare.flips == ["alt", "home"]
+    assert FakeTunnels.flips == ["alt", "home"]
 
     states.home.status = "running"
     assert tick() == "PENDING_MERGE"
@@ -526,7 +541,7 @@ def test_full_cycle(make):
     assert tick() == "HOME_READY"
 
     assert tick() == "NORMAL"
-    assert FakeCloudflare.flips == ["alt", "home", "home"]
+    assert FakeTunnels.flips == ["alt", "home", "home"]
     assert states.instance.ec2.stopped == 1
 
     assert states.sent == [
@@ -632,3 +647,88 @@ def test_build_states_wires_the_clients_from_env():
     assert states.instance.instance_id == "i-9"
     assert states.health_url == "http://h/health"
     assert states.alt_health_url == "https://gv-alt-health.lab-ocp.com/health"
+
+
+# Snapshot / lazy / params / handler
+
+
+def test_snapshot_roundtrips_every_field():
+    values = {}
+    for f in dataclasses.fields(clients.Snapshot):
+        if f.name == "state":
+            values[f.name] = clients.State.PENDING_MERGE
+        elif f.name in clients.DATETIME_FIELDS:
+            values[f.name] = T0
+        elif f.type is bool:
+            values[f.name] = True
+        else:
+            values[f.name] = "x"
+    snap = clients.Snapshot(**values)
+    assert clients.Snapshot.from_json(snap.to_json()) == snap
+
+
+def test_datetime_fields_are_exactly_the_datetime_annotations():
+    declared = {
+        f.name
+        for f in dataclasses.fields(clients.Snapshot)
+        if "datetime" in str(f.type)
+    }
+    assert declared == clients.DATETIME_FIELDS
+
+
+def test_lazy_builds_once_and_only_on_first_use():
+    built = []
+    proxy = clients.lazy(lambda: built.append(1) or FakeHome())
+    assert built == []
+    proxy.home_status()
+    proxy.home_status()
+    assert built == [1]
+
+
+def test_params_reads_everything_in_one_call_and_misses_raise_on_use():
+    ssm = FakeSSM()
+    ssm.params["/home-lab-failover/failover-token"] = "secret"
+    params = clients.Params(ssm)
+    assert params["failover-token"] == "secret"
+    with pytest.raises(KeyError):
+        params["nope"]
+
+
+def test_healthy_run_never_reads_a_secret(monkeypatch):
+    import app
+
+    ssm = FakeSSM()
+    ssm.get_parameters_by_path = lambda **kw: 1 / 0
+    monkeypatch.setattr(
+        clients,
+        "http_open",
+        lambda url, **kw: type(
+            "R", (), {"status": 200, "__enter__": lambda s: s, "__exit__": lambda s, *a: False}
+        )(),
+    )
+    states = app.build_states({"FAILOVER_INSTANCE_ID": "i-1"}, ssm, FakeEC2())
+    assert states.run(T0).state == clients.State.NORMAL
+
+
+def test_failing_back_without_command_id_reruns_failback(make):
+    states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
+    new = states.run(T0)
+    assert ssm.sent == 1
+    assert new.command_id == "cmd-1"
+
+
+def test_handler_error_still_raises_the_original_when_notifying_fails(monkeypatch):
+    import app
+
+    class Boom:
+        def run(self, now):
+            raise ValueError("original")
+
+        @property
+        def telegram(self):
+            raise RuntimeError("ssm down")
+
+    monkeypatch.setattr(app, "build_states", lambda *a: Boom())
+    monkeypatch.setattr(app.boto3, "client", lambda name: None)
+    with pytest.raises(ValueError, match="original"):
+        app.lambda_handler({}, None)

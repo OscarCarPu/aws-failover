@@ -8,6 +8,38 @@ from functools import cached_property
 
 USER_AGENT = "Mozilla/5.0 (compatible; AWS-Lambda/1.0)"
 NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError)
+PREFIX = "/home-lab-failover"
+# SSM command statuses that mean failback.sh is running or done, so it must not be rerun
+LIVE_COMMAND = ("Pending", "InProgress", "Delayed", "Success")
+# Snapshot fields stored as ISO strings
+DATETIME_FIELDS = {"down_since", "up_since", "merge_since", "reminded_at"}
+
+
+def http_open(url, method="GET", body=None, headers=None):
+    """urlopen with the shared User-Agent and timeout. Raises on network and HTTP errors."""
+    req = urllib.request.Request(
+        url,
+        method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"User-Agent": USER_AGENT, **(headers or {})},
+    )
+    return urllib.request.urlopen(req, timeout=5)
+
+
+def lazy(factory):
+    """Proxy that builds the client on first use, so its secrets are only read when needed."""
+    return _Lazy(factory)
+
+
+class _Lazy:
+    def __init__(self, factory):
+        self._factory = factory
+        self._obj = None
+
+    def __getattr__(self, name):
+        if self._obj is None:
+            self._obj = self._factory()
+        return getattr(self._obj, name)
 
 
 class Cloudflare:
@@ -83,23 +115,13 @@ class Telegram:
             print(f"TELEGRAM ERROR: {e!r}")
 
 
-class HomeClient:
-    def __init__(self, failover_url, token):
-        self.failover_url = failover_url
-        self.token = token
-
-    def open(self, url, method="GET", body=None, headers=None):
-        req = urllib.request.Request(
-            url,
-            method=method,
-            data=json.dumps(body).encode() if body is not None else None,
-            headers={"User-Agent": USER_AGENT, **(headers or {})},
-        )
-        return urllib.request.urlopen(req, timeout=5)
+class HealthCheck:
+    """Plain GET against a health url. Needs no token."""
 
     def check(self, url, name):
+        """True if url answered 200, False if it is down. Raises on a bug in the check itself."""
         try:
-            with self.open(url) as r:
+            with http_open(url) as r:
                 healthy = r.status == 200
         except NETWORK_ERRORS:
             healthy = False
@@ -109,9 +131,17 @@ class HomeClient:
         print(f"{name} {'HEALTHY' if healthy else 'UNHEALTHY'}")
         return healthy
 
+
+class HomeClient:
+    """Token-bearing calls to the failover endpoint on home."""
+
+    def __init__(self, failover_url, token):
+        self.failover_url = failover_url
+        self.token = token
+
     def home_call(self, payload):
         try:
-            with self.open(
+            with http_open(
                 self.failover_url,
                 method="POST",
                 body=payload,
@@ -132,7 +162,7 @@ class HomeClient:
 
     def home_status(self):
         try:
-            with self.open(
+            with http_open(
                 self.failover_url + "/status",
                 headers={"X-Failover-Token": self.token},
             ) as r:
@@ -141,19 +171,50 @@ class HomeClient:
             return None
 
 
-class StateStore:
-    prefix = "/home-lab-failover"
-    state_name = f"{prefix}/state"
-    dump_name = f"{prefix}/dump"
-    base_name = f"{prefix}/base"
+class Params:
+    """Config and secrets under the SSM prefix, read in one call on first use."""
 
     def __init__(self, ssm):
         self.ssm = ssm
 
-    def param(self, name):
-        return self.ssm.get_parameter(
-            Name=f"{self.prefix}/{name}", WithDecryption=True
-        )["Parameter"]["Value"]
+    @cached_property
+    def values(self):
+        found, token = {}, {}
+        while True:
+            res = self.ssm.get_parameters_by_path(
+                Path=PREFIX, WithDecryption=True, **token
+            )
+            for p in res["Parameters"]:
+                found[p["Name"].removeprefix(f"{PREFIX}/")] = p["Value"]
+            if "NextToken" not in res:
+                return found
+            token = {"NextToken": res["NextToken"]}
+
+    def __getitem__(self, name):
+        return self.values[name]
+
+
+class Tunnels:
+    """Where the DNS can point. The tunnel ids are read when a flip happens."""
+
+    def __init__(self, cloudflare, params):
+        self.cloudflare = cloudflare
+        self.params = params
+
+    def to_alt(self):
+        return self.cloudflare.flip(self.params["alt-tunnel-id"])
+
+    def to_home(self):
+        return self.cloudflare.flip(self.params["home-tunnel-id"])
+
+
+class StateStore:
+    state_name = f"{PREFIX}/state"
+    dump_name = f"{PREFIX}/dump"
+    base_name = f"{PREFIX}/base"
+
+    def __init__(self, ssm):
+        self.ssm = ssm
 
     def load(self):
         """The saved state as a JSON dict, None before the first save."""
@@ -263,6 +324,8 @@ class Snapshot:
         return replace(self, up_since=None, down_since=self.down_since or now)
 
     def to_json(self):
+        # None and False are the dataclass defaults, so they are left out of the stored
+        # JSON and from_json brings them back.
         out = {}
         for f in fields(self):
             value = getattr(self, f.name)
@@ -284,42 +347,49 @@ class Snapshot:
             value = raw[f.name]
             if f.name == "state":
                 value = State(value)
-            elif f.name.endswith(("_since", "_at")):
+            elif f.name in DATETIME_FIELDS:
                 value = datetime.fromisoformat(value)
             kw[f.name] = value
         return cls(**kw)
+
+
+NORMAL, STARTING, FAILED_OVER, FAILING_BACK, HOME_READY, PENDING_MERGE = State
 
 
 class States:
     down_after = 600  # seconds home must stay down before failing over
     up_after = 600  # seconds home must stay healthy before failing back
     starting_timeout = 2400
+    remind_every = 3600  # seconds between "merge needs answers" reminders
     messages = {
-        (State.NORMAL, State.STARTING): "Home is down, starting the failover instance",
-        (State.STARTING, State.FAILED_OVER): "Failed over to AWS",
-        (State.FAILED_OVER, State.FAILING_BACK): "Home is back, failing back",
-        (State.FAILING_BACK, State.PENDING_MERGE): "Dump ready, home is merging it",
-        (State.PENDING_MERGE, State.HOME_READY): "Merge done on home",
-        (
-            State.PENDING_MERGE,
-            State.FAILED_OVER,
-        ): "Home went down during the merge, back on failover",
-        (State.HOME_READY, State.NORMAL): "Back on home, failover instance stopped",
+        (NORMAL, STARTING): "Home is down, starting the failover instance",
+        (STARTING, FAILED_OVER): "Failed over to AWS",
+        (FAILED_OVER, FAILING_BACK): "Home is back, failing back",
+        (FAILING_BACK, PENDING_MERGE): "Dump ready, home is merging it",
+        (PENDING_MERGE, HOME_READY): "Merge done on home",
+        (PENDING_MERGE, FAILED_OVER): "Home went down during the merge, back on failover",
+        (HOME_READY, NORMAL): "Back on home, failover instance stopped",
     }
 
     def __init__(
         self,
         store,
         instance,
+        health,
+        home,
+        tunnels,
+        telegram,
         health_url,
         alt_health_url,
-        failover_url="https://gv-health.lab-ocp.com/failover",
     ):
         self.store = store
         self.instance = instance
+        self.health = health
+        self.home = home
+        self.tunnels = tunnels
+        self.telegram = telegram
         self.health_url = health_url
         self.alt_health_url = alt_health_url
-        self.failover_url = failover_url
         self.handlers = {
             State.NORMAL: self.normal,
             State.STARTING: self.starting,
@@ -328,23 +398,6 @@ class States:
             State.PENDING_MERGE: self.pending_merge,
             State.HOME_READY: self.home_ready,
         }
-
-    # HELPERS
-    @cached_property
-    def cloudflare(self):
-        return Cloudflare(
-            self.store.param("cloudflare-token"), self.store.param("cloudflare-zone")
-        )
-
-    @cached_property
-    def telegram(self):
-        return Telegram(
-            self.store.param("telegram-token"), self.store.param("telegram-chat-id")
-        )
-
-    @cached_property
-    def home(self):
-        return HomeClient(self.failover_url, self.store.param("failover-token"))
 
     def run(self, now):
         raw = self.store.load()
@@ -360,7 +413,7 @@ class States:
 
     def probe_home(self, snap, now):
         """Checks home. Returns (healthy, snap with down_since / up_since updated)."""
-        healthy = self.home.check(self.health_url, "HOMELAB")
+        healthy = self.health.check(self.health_url, "HOMELAB")
         return healthy, snap.seen(healthy, now)
 
     def home_down_long_enough(self, snap, now):
@@ -369,7 +422,7 @@ class States:
         return not healthy and elapsed(snap.down_since, now) >= self.down_after, snap
 
     def alt_healthy(self):
-        return self.home.check(self.alt_health_url, "ALT")
+        return self.health.check(self.alt_health_url, "ALT")
 
     # STATES
 
@@ -394,7 +447,7 @@ class States:
         if name != "running" or not self.alt_healthy():
             return snap
 
-        self.cloudflare.flip(self.store.param("alt-tunnel-id"))
+        self.tunnels.to_alt()
         return replace(snap, state=State.FAILED_OVER)
 
     def failed_over(self, snap, now):
@@ -417,12 +470,14 @@ class States:
         if self.store.dump_ready():
             if not self.home.home_call({"mode": "merge"}):
                 return snap
-            self.cloudflare.flip(self.store.param("home-tunnel-id"))
+            self.tunnels.to_home()
             return replace(snap, state=State.PENDING_MERGE, merge_since=now)
 
-        status = self.instance.command_status(snap.command_id)
-        if status in ("Pending", "InProgress", "Delayed", "Success"):
-            return snap
+        # a hand-edited state can lack the command id: just run failback again
+        if snap.command_id:
+            status = self.instance.command_status(snap.command_id)
+            if status in LIVE_COMMAND:
+                return snap
 
         return replace(snap, command_id=self.instance.run_failback())
 
@@ -433,7 +488,7 @@ class States:
             return replace(snap, state=State.HOME_READY)
 
         if status == "needs_answers":
-            if snap.reminded_at and elapsed(snap.reminded_at, now) < 3600:
+            if snap.reminded_at and elapsed(snap.reminded_at, now) < self.remind_every:
                 return snap
             self.telegram.send_message("The merge is waiting for your answers (/merge)")
             return replace(snap, reminded_at=now)
@@ -442,7 +497,7 @@ class States:
         if not down:
             return snap
 
-        self.cloudflare.flip(self.store.param("alt-tunnel-id"))
+        self.tunnels.to_alt()
         self.instance.resume_services()
         self.store.clear_dump()
         return Snapshot(State.FAILED_OVER, down_since=snap.down_since)
@@ -452,6 +507,6 @@ class States:
         if not healthy:
             return snap
 
-        self.cloudflare.flip(self.store.param("home-tunnel-id"))
+        self.tunnels.to_home()
         self.instance.stop()
         return Snapshot(State.NORMAL)
