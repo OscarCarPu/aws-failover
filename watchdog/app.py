@@ -2,6 +2,7 @@ import json
 import urllib.error
 import urllib.request
 import os
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from enum import Enum
 from functools import cached_property
@@ -154,9 +155,53 @@ class State(str, Enum):
     PENDING_MERGE = "PENDING_MERGE"
 
 
-def elapsed(ts, now):
-    """Seconds between an ISO timestamp and now."""
-    return (now - datetime.fromisoformat(ts)).total_seconds()
+def elapsed(since, now):
+    """Seconds between a past datetime and now."""
+    return (now - since).total_seconds()
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    state: State
+    down_since: datetime | None = None  # NORMAL, STARTING, FAILED_OVER, PENDING_MERGE
+    up_since: datetime | None = None  # NORMAL, FAILED_OVER, HOME_READY
+    home_held: bool = False  # FAILED_OVER, FAILING_BACK
+    command_id: str | None = None  # FAILING_BACK
+    merge_since: datetime | None = None  # PENDING_MERGE
+    reminded_at: datetime | None = None  # PENDING_MERGE
+
+    def seen(self, healthy, now):
+        """Records one health probe of home: starts its streak, ends the opposite one."""
+        if healthy:
+            return replace(self, down_since=None, up_since=self.up_since or now)
+        return replace(self, up_since=None, down_since=self.down_since or now)
+
+    def to_json(self):
+        out = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if value is None or value is False:
+                continue
+            if isinstance(value, datetime):
+                value = value.isoformat()
+            elif isinstance(value, State):
+                value = value.value
+            out[f.name] = value
+        return out
+
+    @classmethod
+    def from_json(cls, raw):
+        kw = {}
+        for f in fields(cls):
+            if f.name not in raw:
+                continue
+            value = raw[f.name]
+            if f.name == "state":
+                value = State(value)
+            elif f.name.endswith(("_since", "_at")):
+                value = datetime.fromisoformat(value)
+            kw[f.name] = value
+        return cls(**kw)
 
 
 class StateStore:
@@ -179,13 +224,13 @@ class StateStore:
                 self.ssm.get_parameter(Name=self.state_name)["Parameter"]["Value"]
             )
         except self.ssm.exceptions.ParameterNotFound:
-            return {"state": State.NORMAL}
-        return {**raw, "state": State(raw["state"])}
+            return Snapshot(State.NORMAL)
+        return Snapshot.from_json(raw)
 
-    def save(self, state):
+    def save(self, snap):
         self.ssm.put_parameter(
             Name=self.state_name,
-            Value=json.dumps(state),
+            Value=json.dumps(snap.to_json()),
             Type="String",
             Overwrite=True,
         )
@@ -301,122 +346,113 @@ class States:
         return HomeClient(self.failover_url, self.store.param("failover-token"))
 
     def run(self, now):
-        state = self.store.load()
-        new = self.handlers[state["state"]](dict(state), now)
-        if new != state:
+        snap = self.store.load()
+        new = self.handlers[snap.state](snap, now)
+        if new != snap:
             self.store.save(new)
-        print(f"STATE {state['state'].value} -> {new['state'].value}")
-        text = self.messages.get((state["state"], new["state"]))
+        print(f"STATE {snap.state.value} -> {new.state.value}")
+        text = self.messages.get((snap.state, new.state))
         if text:
             self.telegram.send_message(text)
         return new
 
-    def home_healthy(self, state, now):
-        """Also tracks down_since / up_since in `state`."""
+    def probe_home(self, snap, now):
+        """Checks home. Returns (healthy, snap with down_since / up_since updated)."""
         healthy = self.home.check(self.health_url, "HOMELAB")
-        gone, here = (
-            ("down_since", "up_since") if healthy else ("up_since", "down_since")
-        )
-        state.pop(gone, None)
-        state.setdefault(here, now.isoformat())
-        return healthy
+        return healthy, snap.seen(healthy, now)
 
-    def home_down_long_enough(self, state, now):
-        """Checks home (see home_healthy); True once it has been down for down_after."""
-        if self.home_healthy(state, now):
-            return False
-        return elapsed(state["down_since"], now) >= self.down_after
+    def home_down_long_enough(self, snap, now):
+        """Probes home; True once it has been down for down_after. Returns (down, snap)."""
+        healthy, snap = self.probe_home(snap, now)
+        return not healthy and elapsed(snap.down_since, now) >= self.down_after, snap
 
     def alt_healthy(self):
         return self.home.check(self.alt_health_url, "ALT")
 
     # STATES
 
-    def normal(self, state, now):
-        if not self.home_down_long_enough(state, now):
-            return state
+    def normal(self, snap, now):
+        down, snap = self.home_down_long_enough(snap, now)
+        if not down:
+            return snap
 
         self.store.clear_handoff()
 
         self.instance.start()
-        return {**state, "state": State.STARTING}
+        return replace(snap, state=State.STARTING)
 
-    def starting(self, state, now):
-        waited = elapsed(state["down_since"], now)
+    def starting(self, snap, now):
+        waited = elapsed(snap.down_since, now)
         if waited > self.starting_timeout:
             raise RuntimeError(f"alt not healthy after {waited:.0f}s")
         name = self.instance.power()
         if name == "stopped":
             self.instance.start()
-            return state
+            return snap
         if name != "running" or not self.alt_healthy():
-            return state
+            return snap
 
         self.cloudflare.flip(self.store.param("alt-tunnel-id"))
-        return {**state, "state": State.FAILED_OVER}
+        return replace(snap, state=State.FAILED_OVER)
 
-    def failed_over(self, state, now):
-        if not self.home_healthy(state, now):
-            return state
+    def failed_over(self, snap, now):
+        healthy, snap = self.probe_home(snap, now)
+        if not healthy:
+            return snap
 
-        if not state.get("home_held") and self.home.home_call({"mode": "hold"}):
-            state = {**state, "home_held": True}
+        if not snap.home_held and self.home.home_call({"mode": "hold"}):
+            snap = replace(snap, home_held=True)
 
-        if elapsed(state["up_since"], now) < self.up_after:
-            return state
+        if elapsed(snap.up_since, now) < self.up_after:
+            return snap
 
         self.store.clear_dump()
         command_id = self.instance.run(self.failback_command)
-        return {**state, "state": State.FAILING_BACK, "command_id": command_id}
+        return replace(snap, state=State.FAILING_BACK, command_id=command_id)
 
-    def failing_back(self, state, now):
+    def failing_back(self, snap, now):
         """Waits for failback.sh; only reruns it when its command failed."""
         if self.store.dump_ready():
             if not self.home.home_call({"mode": "merge"}):
-                return state
+                return snap
             self.cloudflare.flip(self.store.param("home-tunnel-id"))
-            return {
-                **state,
-                "state": State.PENDING_MERGE,
-                "merge_since": now.isoformat(),
-            }
+            return replace(snap, state=State.PENDING_MERGE, merge_since=now)
 
-        status = self.instance.command_status(state["command_id"])
+        status = self.instance.command_status(snap.command_id)
         if status in ("Pending", "InProgress", "Delayed", "Success"):
-            return state
+            return snap
 
-        return {**state, "command_id": self.instance.run(self.failback_command)}
+        return replace(snap, command_id=self.instance.run(self.failback_command))
 
-    def pending_merge(self, state, now):
+    def pending_merge(self, snap, now):
         """No timeout: only home going down again is a failure."""
         status = self.home.home_status()
         if status == "done":
-            return {**state, "state": State.HOME_READY}
+            return replace(snap, state=State.HOME_READY)
 
         if status == "needs_answers":
-            last = state.get("reminded_at")
-            if last and elapsed(last, now) < 3600:
-                return state
+            if snap.reminded_at and elapsed(snap.reminded_at, now) < 3600:
+                return snap
             self.telegram.send_message("The merge is waiting for your answers (/merge)")
-            return {**state, "reminded_at": now.isoformat()}
+            return replace(snap, reminded_at=now)
 
-        if not self.home_down_long_enough(state, now):
-            return state
+        down, snap = self.home_down_long_enough(snap, now)
+        if not down:
+            return snap
 
         self.cloudflare.flip(self.store.param("alt-tunnel-id"))
         self.instance.run("cd /opt/gv && docker compose start gv-api gv-web")
         self.store.clear_dump()
-        for key in ("home_held", "merge_since", "reminded_at", "command_id"):
-            state.pop(key, None)
-        return {**state, "state": State.FAILED_OVER}
+        return Snapshot(State.FAILED_OVER, down_since=snap.down_since)
 
-    def home_ready(self, state, now):
-        if not self.home_healthy(state, now):
-            return state
+    def home_ready(self, snap, now):
+        healthy, snap = self.probe_home(snap, now)
+        if not healthy:
+            return snap
 
         self.cloudflare.flip(self.store.param("home-tunnel-id"))
         self.instance.stop()
-        return {"state": State.NORMAL}
+        return Snapshot(State.NORMAL)
 
 
 def lambda_handler(event, context):

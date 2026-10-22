@@ -592,3 +592,27 @@ def test_flip_missing_record_raises(monkeypatch):
     cf, _ = cloudflare(monkeypatch, {"gv-api.lab-ocp.com": "h.cfargotunnel.com"})
     with pytest.raises(RuntimeError):
         cf.flip("alt")
+
+
+# Snapshot
+
+
+def test_snapshot_json_roundtrip_and_omits_defaults():
+    snap = app.Snapshot(
+        app.State.FAILING_BACK, up_since=T0, home_held=True, command_id="cmd-1"
+    )
+    raw = snap.to_json()
+    assert raw == {
+        "state": "FAILING_BACK",
+        "up_since": T0.isoformat(),
+        "home_held": True,
+        "command_id": "cmd-1",
+    }
+    assert app.Snapshot.from_json(raw) == snap
+
+
+def test_snapshot_seen_starts_one_streak_and_ends_the_other():
+    snap = app.Snapshot(app.State.NORMAL, up_since=T0)
+    down = snap.seen(False, T0 + timedelta(minutes=5))
+    assert down.up_since is None and down.down_since == T0 + timedelta(minutes=5)
+    assert down.seen(False, T0 + timedelta(minutes=9)).down_since == down.down_since
