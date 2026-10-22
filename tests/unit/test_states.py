@@ -112,7 +112,10 @@ def make(monkeypatch):
     def build(state=None, home=True, alt=True, ec2="running", invocation="Success"):
         ssm = FakeSSM(state, invocation)
         states = app.States(
-            app.StateStore(ssm), ssm, FakeEC2(ec2), "i-1", "http://home/health", "http://alt/health"
+            app.StateStore(ssm),
+            app.Instance(ssm, FakeEC2(ec2), "i-1"),
+            "http://home/health",
+            "http://alt/health",
         )
         states.__dict__["home"] = FakeHome(home, alt)
         states.sent = []
@@ -200,7 +203,7 @@ def test_unknown_state_raises(make):
 
 def test_handler_error_saves_nothing(make):
     states, ssm = make({"state": "NORMAL", "down_since": iso(20)}, home=False)
-    states.ec2.start_instances = lambda InstanceIds: 1 / 0
+    states.instance.ec2.start_instances = lambda InstanceIds: 1 / 0
     with pytest.raises(ZeroDivisionError):
         states.run(T0)
     assert ssm.saved == []
@@ -213,21 +216,21 @@ def test_normal_first_failure_sets_down_since(make):
     states, ssm = make({"state": "NORMAL", "up_since": iso(30)}, home=False)
     states.run(T0)
     assert ssm.saved == [{"state": "NORMAL", "down_since": T0.isoformat()}]
-    assert states.ec2.started == 0
+    assert states.instance.ec2.started == 0
 
 
 def test_normal_under_threshold_waits(make):
     states, ssm = make({"state": "NORMAL", "down_since": iso(9)}, home=False)
     states.run(T0)
     assert ssm.saved == []
-    assert states.ec2.started == 0
+    assert states.instance.ec2.started == 0
 
 
 def test_normal_after_threshold_starts_ec2(make):
     states, ssm = make({"state": "NORMAL", "down_since": iso(10)}, home=False)
     states.run(T0)
     assert ssm.saved[-1]["state"] == "STARTING"
-    assert states.ec2.started == 1
+    assert states.instance.ec2.started == 1
 
 
 def test_normal_recovery_resets_down_since(make):
@@ -239,7 +242,7 @@ def test_normal_recovery_resets_down_since(make):
 def test_normal_clears_base_and_dump_before_starting_ec2(make):
     states, ssm = make({"state": "NORMAL", "down_since": iso(10)}, home=False)
     seen = []
-    states.ec2.start_instances = lambda InstanceIds: seen.append(list(ssm.deleted))
+    states.instance.ec2.start_instances = lambda InstanceIds: seen.append(list(ssm.deleted))
     states.run(T0)
     assert seen == [[[app.StateStore.base_name, app.StateStore.dump_name]]]
 
@@ -250,7 +253,7 @@ def test_normal_clears_base_and_dump_before_starting_ec2(make):
 def test_starting_restarts_a_stopped_instance(make):
     states, ssm = make({"state": "STARTING", "down_since": iso(15)}, ec2="stopped")
     states.run(T0)
-    assert states.ec2.started == 1
+    assert states.instance.ec2.started == 1
     assert ssm.saved == []
 
 
@@ -417,14 +420,14 @@ def test_home_ready_waits_while_home_is_down(make):
     states, ssm = make({"state": "HOME_READY"}, home=False)
     states.run(T0)
     assert FakeCloudflare.flips == []
-    assert states.ec2.stopped == 0
+    assert states.instance.ec2.stopped == 0
 
 
 def test_home_ready_flips_stops_and_goes_normal(make):
     states, ssm = make({"state": "HOME_READY", "dump": "gv-db/hourly/x"})
     states.run(T0)
     assert FakeCloudflare.flips == ["home"]
-    assert states.ec2.stopped == 1
+    assert states.instance.ec2.stopped == 1
     assert ssm.saved == [{"state": "NORMAL"}]
 
 
@@ -487,11 +490,11 @@ def test_full_cycle(make):
 
     checks["HOMELAB"] = False
     assert [tick(), tick(), tick()] == ["NORMAL", "NORMAL", "STARTING"]
-    assert states.ec2.started == 1
+    assert states.instance.ec2.started == 1
 
-    states.ec2.name = "pending"
+    states.instance.ec2.name = "pending"
     assert tick() == "STARTING"
-    states.ec2.name = "running"
+    states.instance.ec2.name = "running"
     assert tick() == "STARTING"
     checks["ALT"] = True
     assert tick() == "FAILED_OVER"
@@ -524,7 +527,7 @@ def test_full_cycle(make):
 
     assert tick() == "NORMAL"
     assert FakeCloudflare.flips == ["alt", "home", "home"]
-    assert states.ec2.stopped == 1
+    assert states.instance.ec2.stopped == 1
 
     assert states.sent == [
         "Home is down, starting the failover instance",

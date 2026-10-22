@@ -200,10 +200,49 @@ class StateStore:
         self.ssm.delete_parameters(Names=[self.base_name, self.dump_name])
 
 
+class Instance:
+    """The failover EC2 instance: power and the shell commands run on it through SSM."""
+
+    def __init__(self, ssm, ec2, instance_id):
+        self.ssm = ssm
+        self.ec2 = ec2
+        self.instance_id = instance_id
+
+    def start(self):
+        self.ec2.start_instances(InstanceIds=[self.instance_id])
+
+    def stop(self):
+        self.ec2.stop_instances(InstanceIds=[self.instance_id])
+
+    def power(self):
+        """EC2 state name: pending, running, stopping, stopped..."""
+        res = self.ec2.describe_instances(InstanceIds=[self.instance_id])
+        return res["Reservations"][0]["Instances"][0]["State"]["Name"]
+
+    def run(self, command):
+        """Starts a shell command on the instance. Returns the command id."""
+        sent = self.ssm.send_command(
+            InstanceIds=[self.instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [command]},
+        )
+        return sent["Command"]["CommandId"]
+
+    def command_status(self, command_id):
+        """SSM status of a command; an unknown invocation counts as Failed."""
+        try:
+            return self.ssm.get_command_invocation(
+                CommandId=command_id, InstanceId=self.instance_id
+            )["Status"]
+        except self.ssm.exceptions.InvocationDoesNotExist:
+            return "Failed"
+
+
 class States:
     down_after = 600  # seconds home must stay down before failing over
     up_after = 600  # seconds home must stay healthy before failing back
     starting_timeout = 2400
+    failback_command = "bash /opt/gv/failback.sh"
     messages = {
         (State.NORMAL, State.STARTING): "Home is down, starting the failover instance",
         (State.STARTING, State.FAILED_OVER): "Failed over to AWS",
@@ -220,17 +259,13 @@ class States:
     def __init__(
         self,
         store,
-        ssm,
-        ec2,
-        instance_id,
+        instance,
         health_url,
         alt_health_url,
         failover_url="https://gv-health.lab-ocp.com/failover",
     ):
         self.store = store
-        self.ssm = ssm
-        self.ec2 = ec2
-        self.instance_id = instance_id
+        self.instance = instance
         self.health_url = health_url
         self.alt_health_url = alt_health_url
         self.failover_url = failover_url
@@ -296,17 +331,16 @@ class States:
 
         self.store.clear_handoff()
 
-        self.ec2.start_instances(InstanceIds=[self.instance_id])
+        self.instance.start()
         return {**state, "state": State.STARTING}
 
     def starting(self, state, now):
         waited = (now - datetime.fromisoformat(state["down_since"])).total_seconds()
         if waited > self.starting_timeout:
             raise RuntimeError(f"alt not healthy after {waited:.0f}s")
-        res = self.ec2.describe_instances(InstanceIds=[self.instance_id])
-        name = res["Reservations"][0]["Instances"][0]["State"]["Name"]
+        name = self.instance.power()
         if name == "stopped":
-            self.ec2.start_instances(InstanceIds=[self.instance_id])
+            self.instance.start()
             return state
         if name != "running" or not self.alt_healthy():
             return state
@@ -326,16 +360,8 @@ class States:
             return state
 
         self.store.clear_dump()
-        sent = self.ssm.send_command(
-            InstanceIds=[self.instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": ["bash /opt/gv/failback.sh"]},
-        )
-        return {
-            **state,
-            "state": State.FAILING_BACK,
-            "command_id": sent["Command"]["CommandId"],
-        }
+        command_id = self.instance.run(self.failback_command)
+        return {**state, "state": State.FAILING_BACK, "command_id": command_id}
 
     def failing_back(self, state, now):
         """Waits for failback.sh; only reruns it when its command failed."""
@@ -349,21 +375,11 @@ class States:
                 "merge_since": now.isoformat(),
             }
 
-        try:
-            status = self.ssm.get_command_invocation(
-                CommandId=state["command_id"], InstanceId=self.instance_id
-            )["Status"]
-        except self.ssm.exceptions.InvocationDoesNotExist:
-            status = "Failed"
+        status = self.instance.command_status(state["command_id"])
         if status in ("Pending", "InProgress", "Delayed", "Success"):
             return state
 
-        sent = self.ssm.send_command(
-            InstanceIds=[self.instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": ["bash /opt/gv/failback.sh"]},
-        )
-        return {**state, "command_id": sent["Command"]["CommandId"]}
+        return {**state, "command_id": self.instance.run(self.failback_command)}
 
     def pending_merge(self, state, now):
         """No timeout: only home going down again is a failure."""
@@ -385,13 +401,7 @@ class States:
             return state
 
         self.cloudflare.flip(self.store.param("alt-tunnel-id"))
-        self.ssm.send_command(
-            InstanceIds=[self.instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={
-                "commands": ["cd /opt/gv && docker compose start gv-api gv-web"]
-            },
-        )
+        self.instance.run("cd /opt/gv && docker compose start gv-api gv-web")
         self.store.clear_dump()
         for key in ("home_held", "merge_since", "reminded_at", "command_id"):
             state.pop(key, None)
@@ -402,7 +412,7 @@ class States:
             return state
 
         self.cloudflare.flip(self.store.param("home-tunnel-id"))
-        self.ec2.stop_instances(InstanceIds=[self.instance_id])
+        self.instance.stop()
         return {"state": State.NORMAL}
 
 
@@ -410,9 +420,7 @@ def lambda_handler(event, context):
     ssm = boto3.client("ssm")
     states = States(
         StateStore(ssm),
-        ssm,
-        boto3.client("ec2"),
-        os.environ["FAILOVER_INSTANCE_ID"],
+        Instance(ssm, boto3.client("ec2"), os.environ["FAILOVER_INSTANCE_ID"]),
         os.getenv("HOME_LAB_API_URL", "https://gv-api.lab-ocp.com") + "/health",
         os.getenv("ALT_HEALTH_URL", "https://gv-alt-health.lab-ocp.com") + "/health",
         os.getenv("HOME_FAILOVER_URL", "https://gv-health.lab-ocp.com/failover"),
