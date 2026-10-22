@@ -360,7 +360,7 @@ class States:
     down_after = 600  # seconds home must stay down before failing over
     up_after = 600  # seconds home must stay healthy before failing back
     starting_timeout = 2400
-    remind_every = 3600  # seconds between "merge needs answers" reminders
+    remind_every = 3600  # seconds between "restore failed" reminders
     messages = {
         (NORMAL, STARTING): "Home is down, starting the failover instance",
         (STARTING, FAILED_OVER): "Failed over to AWS",
@@ -487,10 +487,10 @@ class States:
         if status == "done":
             return replace(snap, state=State.HOME_READY)
 
-        if status == "needs_answers":
+        if status == "failed":
             if snap.reminded_at and elapsed(snap.reminded_at, now) < self.remind_every:
                 return snap
-            self.telegram.send_message("The merge is waiting for your answers (/merge)")
+            self.telegram.send_message("The restore at home failed, see the gv-api logs")
             return replace(snap, reminded_at=now)
 
         down, snap = self.home_down_long_enough(snap, now)

@@ -28,7 +28,7 @@ NORMAL -> STARTING -> FAILED_OVER -> FAILING_BACK -> PENDING_MERGE -> HOME_READY
 | `STARTING` | Waits until the instance is running and `gv-alt-health` answers 200 (the boot unit restored the DB and started the alt tunnel). Then flips both CNAMEs to alt, sets `FAILED_OVER`. Never checks home: once alt is ready it flips. Too long without getting ready fails the run. |
 | `FAILED_OVER` | Checks home. As soon as it answers, asks it once to hold (`POST /failover {"mode":"hold"}`, remembered as `home_held`): home stops serving data and running its workers. After 10 consecutive minutes healthy: deletes `dump`, sets `FAILING_BACK` and sends the first failback command. |
 | `FAILING_BACK` | `failback.sh` (started by `FAILED_OVER`) stops the apps on EC2, dumps the DB and puts the S3 key in the `dump` parameter. Without `dump` the Lambda reruns the script only if its Run Command failed. With `dump` present it asks home to merge (`{"mode":"merge"}`). **No acknowledgement, no flip**: it tries again next run. With it, it flips both CNAMEs to home and sets `PENDING_MERGE`. |
-| `PENDING_MERGE` | Home merges `dump` into its database, using `base` as the common starting point; a conflict is answered by the user in gv-web. The Lambda reads `GET /failover/status`: `done` sets `HOME_READY`; `needs_answers` sends a Telegram reminder at most once an hour; no timeout. If home stays down for 10 minutes it flips back to alt, starts the apps on EC2 and returns to `FAILED_OVER`. |
+| `PENDING_MERGE` | Home restores `dump` as its database and keeps a report, built against `base`, of what it had besides; the user reads it in gv-web. The Lambda reads `GET /failover/status`: `done` sets `HOME_READY`; `failed` sends a Telegram reminder at most once an hour; no timeout. If home stays down for 10 minutes it flips back to alt, starts the apps on EC2 and returns to `FAILED_OVER`. |
 | `HOME_READY` | Checks home first; if down, waits. Then flips both CNAMEs to home, stops EC2 (cloudflared goes with it) and sets `NORMAL`. |
 | `PLANNED` | Set from the gv-web maintenance button after a final backup. Home is shut down on purpose, so it is not read as an outage. |
 
@@ -68,7 +68,7 @@ Every message goes through the Telegram bot (`telegram-token`, `telegram-chat-id
 - `FAILING_BACK -> PENDING_MERGE`: dump ready, home is merging it
 - `PENDING_MERGE -> HOME_READY`: merge done on home
 - `PENDING_MERGE -> FAILED_OVER`: home went down during the merge, back on failover
-- `PENDING_MERGE`, conflicts waiting: reminder, at most once an hour
+- `PENDING_MERGE`, restore failed at home: reminder, at most once an hour
 - `HOME_READY -> NORMAL`: back on home, instance stopped
 - any error in a run: `Watchdog error: <error>`, then the run still fails
 

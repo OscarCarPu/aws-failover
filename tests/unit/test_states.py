@@ -372,9 +372,9 @@ def test_pending_merge_waits_while_home_merges(make):
     assert ssm.saved == []
 
 
-def test_pending_merge_reminds_once_an_hour(make):
+def test_pending_merge_reminds_once_an_hour_when_the_restore_failed(make):
     states, ssm = make({"state": "PENDING_MERGE"})
-    states.home.status = "needs_answers"
+    states.home.status = "failed"
     states.run(T0)
     states.run(T0 + timedelta(minutes=5))
     assert len(states.sent) == 1
