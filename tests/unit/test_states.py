@@ -84,6 +84,25 @@ class FakeTelegram:
     def __init__(self, sent):
         self.send_message = sent.append
 
+class FakeHome:
+    def __init__(self, home=True, alt=True):
+        self.checks = {"HOMELAB": home, "ALT": alt}
+        self.checked = []
+        self.calls = []
+        self.acked = True
+        self.status = None
+
+    def check(self, url, name):
+        self.checked.append(name)
+        return self.checks[name]
+
+    def home_call(self, payload):
+        self.calls.append(payload)
+        return self.acked
+
+    def home_status(self):
+        return self.status
+
 
 @pytest.fixture
 def make(monkeypatch):
@@ -95,13 +114,7 @@ def make(monkeypatch):
         states = app.States(
             ssm, FakeEC2(ec2), "i-1", "http://home/health", "http://alt/health"
         )
-        checks = {"HOMELAB": home, "ALT": alt}
-        monkeypatch.setattr(states, "check", lambda url, name: checks[name])
-        states.calls = []
-        states.acked = True
-        states.status = None
-        states.home_call = lambda payload: states.calls.append(payload) or states.acked
-        states.home_status = lambda: states.status
+        states.__dict__["home"] = FakeHome(home, alt)
         states.sent = []
         states.__dict__["telegram"] = FakeTelegram(states.sent)
         return states, ssm
@@ -118,7 +131,11 @@ def iso(minutes_ago):
 
 def fake_urlopen(monkeypatch, status=200, exc=None):
     class Resp:
-        pass
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
 
     Resp.status = status
 
@@ -131,7 +148,7 @@ def fake_urlopen(monkeypatch, status=200, exc=None):
 
 
 def checker():
-    return app.States(None, None, "i-1", "http://home/health", "http://alt/health")
+    return app.HomeClient("http://home/failover", "tok")
 
 
 def test_check_ok(monkeypatch, capsys):
@@ -245,12 +262,10 @@ def test_starting_waits(make, kw):
     assert FakeCloudflare.flips == []
 
 
-def test_starting_flips_when_alt_is_healthy_without_checking_home(make, monkeypatch):
+def test_starting_flips_when_alt_is_healthy_without_checking_home(make):
     states, ssm = make({"state": "STARTING", "down_since": iso(15)}, home=False)
-    seen = []
-    monkeypatch.setattr(states, "check", lambda url, name: seen.append(name) or True)
     states.run(T0)
-    assert seen == ["ALT"]
+    assert states.home.checked == ["ALT"]
     assert FakeCloudflare.flips == ["alt"]
     assert ssm.saved[-1]["state"] == "FAILED_OVER"
 
@@ -277,7 +292,7 @@ def test_failed_over_first_healthy_sets_up_since(make):
     assert ssm.saved == [
         {"state": "FAILED_OVER", "up_since": T0.isoformat(), "home_held": True}
     ]
-    assert states.calls == [{"mode": "hold"}]
+    assert states.home.calls == [{"mode": "hold"}]
     assert ssm.sent == 0
 
 
@@ -307,7 +322,7 @@ def test_failing_back_with_a_dump_asks_home_to_merge_and_flips(make):
     states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
     ssm.params[app.DUMP] = "gv-db/hourly/x"
     states.run(T0)
-    assert states.calls == [{"mode": "merge"}]
+    assert states.home.calls == [{"mode": "merge"}]
     assert FakeCloudflare.flips == ["home"]
     assert ssm.saved[-1]["state"] == "PENDING_MERGE"
     assert ssm.sent == 0
@@ -316,7 +331,7 @@ def test_failing_back_with_a_dump_asks_home_to_merge_and_flips(make):
 def test_failing_back_without_an_ack_does_not_flip(make):
     states, ssm = make({"state": "FAILING_BACK"}, invocation=None)
     ssm.params[app.DUMP] = "gv-db/hourly/x"
-    states.acked = False
+    states.home.acked = False
     states.run(T0)
     assert FakeCloudflare.flips == []
     assert ssm.saved == []
@@ -327,21 +342,21 @@ def test_failing_back_without_an_ack_does_not_flip(make):
 
 def test_pending_merge_done_goes_home_ready(make):
     states, ssm = make({"state": "PENDING_MERGE"})
-    states.status = "done"
+    states.home.status = "done"
     states.run(T0)
     assert ssm.saved[-1]["state"] == "HOME_READY"
 
 
 def test_pending_merge_waits_while_home_merges(make):
     states, ssm = make({"state": "PENDING_MERGE", "up_since": iso(5)})
-    states.status = "running"
+    states.home.status = "running"
     states.run(T0)
     assert ssm.saved == []
 
 
 def test_pending_merge_reminds_once_an_hour(make):
     states, ssm = make({"state": "PENDING_MERGE"})
-    states.status = "needs_answers"
+    states.home.status = "needs_answers"
     states.run(T0)
     states.run(T0 + timedelta(minutes=5))
     assert len(states.sent) == 1
@@ -455,10 +470,9 @@ def test_send_message_failure_is_only_logged(monkeypatch, capsys):
 # full cycle
 
 
-def test_full_cycle(make, monkeypatch):
-    states, ssm = make()
-    checks = {"HOMELAB": True, "ALT": False}
-    monkeypatch.setattr(states, "check", lambda url, name: checks[name])
+def test_full_cycle(make):
+    states, ssm = make(alt=False)
+    checks = states.home.checks
     clock = {"minutes": 0}
 
     def tick():
@@ -498,14 +512,14 @@ def test_full_cycle(make, monkeypatch):
     failing.pop("command_id")
     ssm.params[app.DUMP] = "gv-db/hourly/x"
     assert tick() == "PENDING_MERGE"
-    assert states.calls[-1] == {"mode": "merge"}
+    assert states.home.calls[-1] == {"mode": "merge"}
     assert ssm.sent == 1
     assert ssm.deleted == [[app.BASE, app.DUMP], [app.DUMP]]
     assert FakeCloudflare.flips == ["alt", "home"]
 
-    states.status = "running"
+    states.home.status = "running"
     assert tick() == "PENDING_MERGE"
-    states.status = "done"
+    states.home.status = "done"
     assert tick() == "HOME_READY"
 
     assert tick() == "NORMAL"

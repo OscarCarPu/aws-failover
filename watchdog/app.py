@@ -8,6 +8,11 @@ from functools import cached_property
 
 import boto3
 
+# Constants
+
+USER_AGENT = "Mozilla/5.0 (compatible; AWS-Lambda/1.0)"
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError)
+
 
 class Cloudflare:
     api = "https://api.cloudflare.com/client/v4"
@@ -82,6 +87,64 @@ class Telegram:
             print(f"TELEGRAM ERROR: {e!r}")
 
 
+class HomeClient:
+    def __init__(self, failover_url, token):
+        self.failover_url = failover_url
+        self.token = token
+
+    def open(self, url, method="GET", body=None, headers=None):
+        req = urllib.request.Request(
+            url,
+            method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"User-Agent": USER_AGENT, **(headers or {})},
+        )
+        return urllib.request.urlopen(req, timeout=5)
+
+    def check(self, url, name):
+        try:
+            with self.open(url) as r:
+                healthy = r.status == 200
+        except NETWORK_ERRORS:
+            healthy = False
+        except Exception as e:
+            print(f"{name} CHECK ERROR: {e!r}")
+            raise
+        print(f"{name} {'HEALTHY' if healthy else 'UNHEALTHY'}")
+        return healthy
+
+    def home_call(self, payload):
+        try:
+            with self.open(
+                self.failover_url,
+                method="POST",
+                body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Failover-Token": self.token,
+                },
+            ) as r:
+                acked = r.status == 200
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise RuntimeError(f"home refused the failover token({e.code})") from e
+            acked = False
+        except NETWORK_ERRORS:
+            acked = False
+        print(f"HOME CALL {payload['mode']} {'ACK' if acked else 'NO ACK'}")
+        return acked
+
+    def home_status(self):
+        try:
+            with self.open(
+                self.failover_url + "/status",
+                headers={"X-Failover-Token": self.token},
+            ) as r:
+                return json.load(r)["merge"]
+        except NETWORK_ERRORS:
+            return None
+
+
 class State(str, Enum):
     NORMAL = "NORMAL"
     STARTING = "STARTING"
@@ -106,7 +169,10 @@ class States:
         (State.FAILED_OVER, State.FAILING_BACK): "Home is back, failing back",
         (State.FAILING_BACK, State.PENDING_MERGE): "Dump ready, home is merging it",
         (State.PENDING_MERGE, State.HOME_READY): "Merge done on home",
-        (State.PENDING_MERGE, State.FAILED_OVER): "Home went down during the merge, back on failover",
+        (
+            State.PENDING_MERGE,
+            State.FAILED_OVER,
+        ): "Home went down during the merge, back on failover",
         (State.HOME_READY, State.NORMAL): "Back on home, failover instance stopped",
     }
 
@@ -135,7 +201,6 @@ class States:
         }
 
     # HELPERS
-
     def param(self, name):
         return self.ssm.get_parameter(
             Name=f"/home-lab-failover/{name}", WithDecryption=True
@@ -148,6 +213,10 @@ class States:
     @cached_property
     def telegram(self):
         return Telegram(self.param("telegram-token"), self.param("telegram-chat-id"))
+
+    @cached_property
+    def home(self):
+        return HomeClient(self.failover_url, self.param("failover-token"))
 
     def load(self):
         try:
@@ -177,25 +246,9 @@ class States:
             self.telegram.send_message(text)
         return new
 
-    def check(self, url, name):
-        """True if url answered 200, False if it is down. Raises on a bug in the check itself."""
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AWS-Lambda/1.0)"},
-        )
-        try:
-            healthy = urllib.request.urlopen(req, timeout=5).status == 200
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            healthy = False
-        except Exception as e:
-            print(f"{name} CHECK ERROR: {e!r}")
-            raise
-        print(f"{name} {'HEALTHY' if healthy else 'UNHEALTHY'}")
-        return healthy
-
     def home_healthy(self, state, now):
         """Also tracks down_since / up_since in `state`."""
-        healthy = self.check(self.health_url, "HOMELAB")
+        healthy = self.home.check(self.health_url, "HOMELAB")
         gone, here = (
             ("down_since", "up_since") if healthy else ("up_since", "down_since")
         )
@@ -204,44 +257,7 @@ class States:
         return healthy
 
     def alt_healthy(self):
-        return self.check(self.alt_health_url, "ALT")
-
-    def home_call(self, payload):
-        req = urllib.request.Request(
-            self.failover_url,
-            method="POST",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "X-Failover-Token": self.param("failover-token"),
-                "User-Agent": "Mozilla/5.0 (compatible; AWS-Lambda/1.0)",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                acked = r.status == 200
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                raise RuntimeError(f"home refused the failover token ({e.code})") from e
-            acked = False
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            acked = False
-        print(f"HOME CALL {payload['mode']} {'ACK' if acked else 'NO ACK'}")
-        return acked
-
-    def home_status(self):
-        req = urllib.request.Request(
-            self.failover_url + "/status",
-            headers={
-                "X-Failover-Token": self.param("failover-token"),
-                "User-Agent": "Mozilla/5.0 (compatible; AWS-Lambda/1.0)",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                return json.load(r)["merge"]
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            return None
+        return self.home.check(self.alt_health_url, "ALT")
 
     # STATES
 
@@ -277,7 +293,7 @@ class States:
         if not self.home_healthy(state, now):
             return state
 
-        if not state.get("home_held") and self.home_call({"mode": "hold"}):
+        if not state.get("home_held") and self.home.home_call({"mode": "hold"}):
             state = {**state, "home_held": True}
 
         up_for = (now - datetime.fromisoformat(state["up_since"])).total_seconds()
@@ -303,10 +319,14 @@ class States:
         except self.ssm.exceptions.ParameterNotFound:
             pass
         else:
-            if not self.home_call({"mode": "merge"}):
+            if not self.home.home_call({"mode": "merge"}):
                 return state
             self.cloudflare.flip(self.param("home-tunnel-id"))
-            return {**state, "state": State.PENDING_MERGE, "merge_since": now.isoformat()}
+            return {
+                **state,
+                "state": State.PENDING_MERGE,
+                "merge_since": now.isoformat(),
+            }
 
         try:
             status = self.ssm.get_command_invocation(
@@ -326,7 +346,7 @@ class States:
 
     def pending_merge(self, state, now):
         """No timeout: only home going down again is a failure."""
-        status = self.home_status()
+        status = self.home.home_status()
         if status == "done":
             return {**state, "state": State.HOME_READY}
 
@@ -347,7 +367,9 @@ class States:
         self.ssm.send_command(
             InstanceIds=[self.instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": ["cd /opt/gv && docker compose start gv-api gv-web"]},
+            Parameters={
+                "commands": ["cd /opt/gv && docker compose start gv-api gv-web"]
+            },
         )
         self.ssm.delete_parameters(Names=[DUMP])
         for key in ("home_held", "merge_since", "reminded_at", "command_id"):
