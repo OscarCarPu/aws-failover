@@ -108,9 +108,14 @@ class FakeHome:
         self.calls = []
         self.acked = True
         self.status = None
+        self.recorded = []
 
     def home_call(self, payload):
         self.calls.append(payload)
+        return self.acked
+
+    def record_failover(self, ec2_up_at, home_at):
+        self.recorded.append((ec2_up_at, home_at))
         return self.acked
 
     def home_status(self):
@@ -444,6 +449,121 @@ def test_home_ready_flips_stops_and_goes_normal(make):
     assert FakeTunnels.flips == ["home"]
     assert states.instance.ec2.stopped == 1
     assert ssm.saved == [{"state": "NORMAL"}]
+    assert states.home.recorded == []
+
+
+def test_home_ready_records_the_failover_then_goes_normal(make):
+    states, ssm = make(
+        {"state": "HOME_READY", "ec2_up_at": iso(40), "merge_since": iso(5)}
+    )
+    states.run(T0)
+    assert states.home.recorded == [
+        (T0 - timedelta(minutes=40), T0 - timedelta(minutes=5))
+    ]
+    assert states.instance.ec2.stopped == 1
+    assert ssm.saved == [{"state": "NORMAL"}]
+
+
+def test_home_ready_without_an_ack_waits_and_stops_nothing(make):
+    states, ssm = make(
+        {"state": "HOME_READY", "ec2_up_at": iso(40), "merge_since": iso(5)}
+    )
+    states.home.acked = False
+    states.run(T0)
+    assert FakeTunnels.flips == []
+    assert states.instance.ec2.stopped == 0
+    assert all(s["state"] == "HOME_READY" for s in ssm.saved)
+
+
+def test_starting_flip_records_when_ec2_became_available(make):
+    states, ssm = make({"state": "STARTING", "down_since": iso(15)})
+    states.run(T0)
+    assert ssm.saved[-1]["state"] == "FAILED_OVER"
+    assert ssm.saved[-1]["ec2_up_at"] == T0.isoformat()
+
+
+def test_pending_merge_done_keeps_both_instants(make):
+    states, ssm = make(
+        {"state": "PENDING_MERGE", "ec2_up_at": iso(30), "merge_since": iso(5)}
+    )
+    states.home.status = "done"
+    states.run(T0)
+    assert ssm.saved[-1]["state"] == "HOME_READY"
+    assert ssm.saved[-1]["ec2_up_at"] == iso(30)
+    assert ssm.saved[-1]["merge_since"] == iso(5)
+
+
+def test_pending_merge_rollback_keeps_ec2_up_at(make):
+    states, ssm = make(
+        {
+            "state": "PENDING_MERGE",
+            "down_since": iso(11),
+            "ec2_up_at": iso(60),
+            "merge_since": iso(20),
+        },
+        home=False,
+    )
+    states.run(T0)
+    assert ssm.saved[-1]["state"] == "FAILED_OVER"
+    assert ssm.saved[-1]["ec2_up_at"] == iso(60)
+    assert "merge_since" not in ssm.saved[-1]
+
+
+# home client
+
+
+class Resp:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_record_failover_posts_both_instants(monkeypatch):
+    seen = {}
+
+    def urlopen(req, timeout):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data)
+        seen["token"] = req.get_header("X-failover-token")
+        return Resp()
+
+    monkeypatch.setattr(clients.urllib.request, "urlopen", urlopen)
+    home = clients.HomeClient("https://home/failover", "tok")
+
+    assert home.record_failover(T0 - timedelta(minutes=40), T0) is True
+    assert seen == {
+        "url": "https://home/failover/outage",
+        "body": {
+            "ec2_up_at": (T0 - timedelta(minutes=40)).isoformat(),
+            "home_at": T0.isoformat(),
+        },
+        "token": "tok",
+    }
+
+
+def test_record_failover_with_a_wrong_token_raises(monkeypatch):
+    def urlopen(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 401, "no", {}, None)
+
+    monkeypatch.setattr(clients.urllib.request, "urlopen", urlopen)
+    home = clients.HomeClient("https://home/failover", "tok")
+
+    with pytest.raises(RuntimeError):
+        home.record_failover(T0, T0)
+
+
+def test_record_failover_without_a_network_is_no_ack(monkeypatch):
+    def urlopen(req, timeout):
+        raise urllib.error.URLError("down")
+
+    monkeypatch.setattr(clients.urllib.request, "urlopen", urlopen)
+    home = clients.HomeClient("https://home/failover", "tok")
+
+    assert home.record_failover(T0, T0) is False
 
 
 # telegram

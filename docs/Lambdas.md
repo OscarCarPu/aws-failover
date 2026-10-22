@@ -25,11 +25,11 @@ NORMAL -> STARTING -> FAILED_OVER -> FAILING_BACK -> PENDING_MERGE -> HOME_READY
 | State | What it does each run |
 |---|---|
 | `NORMAL` | Checks home. After 10 minutes down: starts EC2, sets `STARTING`. |
-| `STARTING` | Waits until the instance is running and `gv-alt-health` answers 200 (the boot unit restored the DB and started the alt tunnel). Then flips both CNAMEs to alt, sets `FAILED_OVER`. Never checks home: once alt is ready it flips. Too long without getting ready fails the run. |
+| `STARTING` | Waits until the instance is running and `gv-alt-health` answers 200 (the boot unit restored the DB and started the alt tunnel). Then flips both CNAMEs to alt, sets `FAILED_OVER` and saves `ec2_up_at`, the instant the service came back. Never checks home: once alt is ready it flips. Too long without getting ready fails the run. |
 | `FAILED_OVER` | Checks home. As soon as it answers, asks it once to hold (`POST /failover {"mode":"hold"}`, remembered as `home_held`): home stops serving data and running its workers. After 10 consecutive minutes healthy: deletes `dump`, sets `FAILING_BACK` and sends the first failback command. |
 | `FAILING_BACK` | `failback.sh` (started by `FAILED_OVER`) stops the apps on EC2, dumps the DB and puts the S3 key in the `dump` parameter. Without `dump` the Lambda reruns the script only if its Run Command failed. With `dump` present it asks home to merge (`{"mode":"merge"}`). **No acknowledgement, no flip**: it tries again next run. With it, it flips both CNAMEs to home and sets `PENDING_MERGE`. |
 | `PENDING_MERGE` | Home restores `dump` as its database and keeps a report, built against `base`, of what it had besides; the user reads it in gv-web. The Lambda reads `GET /failover/status`: `done` sets `HOME_READY`; `failed` sends a Telegram reminder at most once an hour; no timeout. If home stays down for 10 minutes it flips back to alt, starts the apps on EC2 and returns to `FAILED_OVER`. |
-| `HOME_READY` | Checks home first; if down, waits. Then flips both CNAMEs to home, stops EC2 (cloudflared goes with it) and sets `NORMAL`. |
+| `HOME_READY` | Checks home first; if down, waits. Then sends home the failover record (`POST /failover/outage` with `ec2_up_at` and `merge_since`); **no acknowledgement, no stop**: it tries again next run. With it, flips both CNAMEs to home, stops EC2 (cloudflared goes with it) and sets `NORMAL`. A state without those two instants skips the record. |
 | `PLANNED` | Set from the gv-web maintenance button after a final backup. Home is shut down on purpose, so it is not read as an outage. |
 
 Notes:
@@ -46,7 +46,7 @@ Notes:
 
 SSM parameters under `/home-lab-failover/`:
 
-- `state`: current state, `down_since` / `up_since`, pending Run Command id, `home_held`, `merge_since`, `reminded_at`
+- `state`: current state, `down_since` / `up_since`, pending Run Command id, `home_held`, `merge_since`, `reminded_at`, `ec2_up_at`
 - `base`: S3 key of the dump EC2 restored when the failover started. Written once by `boot.sh`, deleted by the Lambda before it starts the instance
 - `dump`: S3 key of the failback dump. Written by `failback.sh`, deleted by the Lambda before it starts the failback and when a merge is rolled back
 - `cloudflare-token`, `telegram-token`, `failover-token`: SecureString, read only by the Lambda (home has its own copy of `failover-token` in gv-api's `.env`)

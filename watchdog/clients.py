@@ -12,7 +12,7 @@ PREFIX = "/home-lab-failover"
 # SSM command statuses that mean failback.sh is running or done, so it must not be rerun
 LIVE_COMMAND = ("Pending", "InProgress", "Delayed", "Success")
 # Snapshot fields stored as ISO strings
-DATETIME_FIELDS = {"down_since", "up_since", "merge_since", "reminded_at"}
+DATETIME_FIELDS = {"down_since", "up_since", "merge_since", "reminded_at", "ec2_up_at"}
 
 
 def http_open(url, method="GET", body=None, headers=None):
@@ -140,9 +140,16 @@ class HomeClient:
         self.token = token
 
     def home_call(self, payload):
+        return self._post(self.failover_url, payload, f"HOME CALL {payload['mode']}")
+
+    def record_failover(self, ec2_up_at, home_at):
+        payload = {"ec2_up_at": ec2_up_at.isoformat(), "home_at": home_at.isoformat()}
+        return self._post(self.failover_url + "/outage", payload, "HOME RECORD")
+
+    def _post(self, url, payload, label):
         try:
             with http_open(
-                self.failover_url,
+                url,
                 method="POST",
                 body=payload,
                 headers={
@@ -157,7 +164,7 @@ class HomeClient:
             acked = False
         except NETWORK_ERRORS:
             acked = False
-        print(f"HOME CALL {payload['mode']} {'ACK' if acked else 'NO ACK'}")
+        print(f"{label} {'ACK' if acked else 'NO ACK'}")
         return acked
 
     def home_status(self):
@@ -316,6 +323,7 @@ class Snapshot:
     command_id: str | None = None  # FAILING_BACK
     merge_since: datetime | None = None  # PENDING_MERGE
     reminded_at: datetime | None = None  # PENDING_MERGE
+    ec2_up_at: datetime | None = None  # FAILED_OVER, FAILING_BACK, PENDING_MERGE, HOME_READY
 
     def seen(self, healthy, now):
         """Records one health probe of home: starts its streak, ends the opposite one."""
@@ -448,7 +456,7 @@ class States:
             return snap
 
         self.tunnels.to_alt()
-        return replace(snap, state=State.FAILED_OVER)
+        return replace(snap, state=State.FAILED_OVER, ec2_up_at=now)
 
     def failed_over(self, snap, now):
         healthy, snap = self.probe_home(snap, now)
@@ -500,12 +508,16 @@ class States:
         self.tunnels.to_alt()
         self.instance.resume_services()
         self.store.clear_dump()
-        return Snapshot(State.FAILED_OVER, down_since=snap.down_since)
+        return Snapshot(State.FAILED_OVER, down_since=snap.down_since, ec2_up_at=snap.ec2_up_at)
 
     def home_ready(self, snap, now):
         healthy, snap = self.probe_home(snap, now)
         if not healthy:
             return snap
+
+        if snap.ec2_up_at and snap.merge_since:
+            if not self.home.record_failover(snap.ec2_up_at, snap.merge_since):
+                return snap
 
         self.tunnels.to_home()
         self.instance.stop()
