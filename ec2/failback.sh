@@ -6,7 +6,7 @@ set +a
 cd /opt/gv
 
 docker compose stop gv-web gv-api
-docker compose run --rm --no-deps gv-api ./main backup
+docker compose run --rm --no-deps gv-api gv-api backup
 
 name=$(ls backups/hourly | grep -E '^gv-db-[0-9]{8}T[0-9]{6}Z\.sql\.gz$' | sort | tail -n 1)
 put() {
